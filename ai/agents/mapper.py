@@ -23,7 +23,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -200,8 +199,9 @@ def _call_llm_for_mapping(
     prompt = f"CSV metadata:\n{json.dumps(prompt_data, default=str, indent=2)}"
 
     try:
-        from ai.llm import call_structured_llm
         from pydantic import BaseModel
+
+        from ai.llm import call_structured_llm
 
         class _MapSchema(BaseModel):
             date_col: Optional[str] = None

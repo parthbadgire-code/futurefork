@@ -1,455 +1,313 @@
 """
 FutureFork Integration Bridge
-Bridges Backend (B) with Engine (C) and AI Layer (D).
-Attempts to call C's and D's modules when available; otherwise provides reference fallback execution.
+Connects the FastAPI backend to the engine (CP-SAT + Monte Carlo) and the AI layer.
+
+Golden Rule: this module never fabricates numbers. If the engine cannot evaluate a
+branch, the exception propagates and the runner marks that scenario as failed.
 """
 
-from typing import Any, Dict, List
+from __future__ import annotations
+
+import dataclasses
+import uuid
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional
+
+from ai.agents.explainer import explain_branches
+from ai.agents.parser import DecisionParseError, parse_financial_decision
+from ai.agents.scenario import build_forks
+from engine.changes import BRANCH_TYPES
+from engine.model import FinancialProblemInstance
+from engine.solver import evaluate_financial_branch
+
+DEFAULT_DATASET_TYPE = "personal"
 
 
-# Dynamic import helpers for C and D
-def call_parse_decision(text: str, dataset_summary: Dict[str, Any]) -> Dict[str, Any]:
-    """Calls D's parse_financial_decision(text, ...) or reference parser."""
-    # Try current API first
-    try:
-        import dataclasses
+# ---------------------------------------------------------------------------
+# Dataset helpers
+# ---------------------------------------------------------------------------
 
-        from ai.agents.parser import parse_financial_decision
-        dataset_type = dataset_summary.get("dataset_type", "personal")
-        result = parse_financial_decision(text, baseline=dataset_summary, dataset_type=dataset_type)
-        # parse_financial_decision returns a ParsedDecision dataclass — convert to pipeline dict
-        if dataclasses.is_dataclass(result) and not isinstance(result, type):
-            pd = dataclasses.asdict(result)
-            # Normalize ParsedDecision fields into the pipeline dict shape expected by routes + DB
-            return {
-                "id": f"dec_{abs(hash(text)) % 1000000}",
-                "text": pd.get("raw_prompt", text),
-                "dataset_id": dataset_summary["id"],
-                "objectives": [
-                    {"metric": "cash_out_risk_pct", "direction": "minimize"},
-                    {"metric": "survival_score_pct", "direction": "maximize"},
-                ],
-                "constraints": [
-                    {"kind": "emergency_floor", "params": {"floor": pd.get("emergency_floor", 0.0)}}
-                ],
-                "change": {
-                    "type": pd.get("financing_preference", "upfront"),
-                    "params": {
-                        "total_cost": pd.get("total_cost", 0.0),
-                        "emergency_floor": pd.get("emergency_floor", 0.0),
-                        "item_label": pd.get("item_label", ""),
-                        "quantity": pd.get("quantity"),
-                        "target_month": pd.get("target_month", 0),
-                        "emi_months": pd.get("emi_months", 12),
-                    },
-                },
-                "financial": pd,  # keep raw ParsedDecision for downstream use
-                "status": "ok",
-                "message": None,
-            }
-        return result if isinstance(result, dict) else dict(result)
-    except (ImportError, AttributeError, ModuleNotFoundError):
-        pass
+def load_instance(dataset_payload: Dict[str, Any]) -> FinancialProblemInstance:
+    """Rebuilds the compiled 12-month FinancialProblemInstance stored with a dataset."""
+    raw = (dataset_payload or {}).get("instance")
+    if not raw:
+        raise ValueError("Dataset has no compiled financial instance; re-commit the CSV.")
+    return FinancialProblemInstance.from_dict(raw)
 
-    # Reference Parser Implementation
-    lower = text.lower()
 
-    # Unsupported check
-    if any(k in lower for k in ["crypto", "bitcoin", "weather"]):
-        return {
-            "id": f"dec_{abs(hash(text)) % 1000000}",
-            "text": text,
-            "dataset_id": dataset_summary["id"],
-            "objectives": [],
-            "constraints": [],
-            "change": {"type": "upfront", "params": {}},
-            "status": "unsupported",
-            "message": "Unsupported decision domain. FutureFork supports financial CSV analysis: upfront, emi, phased_delay, and discretionary_trim.",
-        }
+def dataset_type_of(dataset_payload: Dict[str, Any]) -> str:
+    summary = (dataset_payload or {}).get("summary", {})
+    return summary.get("dataset_type") or DEFAULT_DATASET_TYPE
 
-    # Clarification check
-    if len(text.strip()) < 15 or "fix everything" in lower or "make it better" in lower:
-        return {
-            "id": f"dec_{abs(hash(text)) % 1000000}",
-            "text": text,
-            "dataset_id": dataset_summary["id"],
-            "objectives": [],
-            "constraints": [],
-            "change": {"type": "upfront", "params": {}},
-            "status": "needs_clarification",
-            "message": 'Please specify your financial decision (e.g., "Buy 40 GPU PCs for ₹60L without dropping below ₹25L reserve").',
-        }
 
-    # Policy 1: EMI / Lease
-    if any(k in lower for k in ["emi", "lease", "installment", "monthly payment"]):
-        return {
-            "id": f"dec_{abs(hash(text)) % 1000000}",
-            "text": text,
-            "dataset_id": dataset_summary["id"],
-            "objectives": [
-                {"metric": "cash_out_risk_pct", "direction": "minimize"},
-                {"metric": "survival_score_pct", "direction": "maximize"},
-            ],
-            "constraints": [{"kind": "emergency_floor", "params": {}}],
-            "change": {"type": "emi", "params": {"months": 12}},
-            "status": "ok",
-            "message": None,
-        }
+# ---------------------------------------------------------------------------
+# 1. Decision parsing
+# ---------------------------------------------------------------------------
 
-    # Policy 2: Phased / Milestone Split
-    if any(k in lower for k in ["phase", "split", "milestone", "delay", "50/50"]):
-        return {
-            "id": f"dec_{abs(hash(text)) % 1000000}",
-            "text": text,
-            "dataset_id": dataset_summary["id"],
-            "objectives": [
-                {"metric": "cash_out_risk_pct", "direction": "minimize"},
-                {"metric": "p10_worst_balance", "direction": "maximize"},
-            ],
-            "constraints": [{"kind": "emergency_floor", "params": {}}],
-            "change": {"type": "phased_delay", "params": {"splits": [{"month": 0, "pct": 0.5}, {"month": 6, "pct": 0.5}]}},
-            "status": "ok",
-            "message": None,
-        }
-
-    # Policy 3: Discretionary Trim
-    if any(k in lower for k in ["trim", "cut", "reduce", "discretionary", "spend less"]):
-        return {
-            "id": f"dec_{abs(hash(text)) % 1000000}",
-            "text": text,
-            "dataset_id": dataset_summary["id"],
-            "objectives": [
-                {"metric": "survival_score_pct", "direction": "maximize"},
-                {"metric": "cash_out_risk_pct", "direction": "minimize"},
-            ],
-            "constraints": [{"kind": "emergency_floor", "params": {}}],
-            "change": {"type": "discretionary_trim", "params": {"max_cut_pct": 0.30}},
-            "status": "ok",
-            "message": None,
-        }
-
-    # Default: Upfront Buy
-    return {
-        "id": f"dec_{abs(hash(text)) % 1000000}",
+def call_parse_decision(
+    text: str,
+    dataset_id: str,
+    instance: Optional[FinancialProblemInstance],
+    dataset_type: str = DEFAULT_DATASET_TYPE,
+) -> Dict[str, Any]:
+    """Parses a plain-English decision into a DecisionSpec dict."""
+    decision_id = f"dec_{uuid.uuid4().hex[:12]}"
+    base = {
+        "id": decision_id,
         "text": text,
-        "dataset_id": dataset_summary["id"],
+        "dataset_id": dataset_id,
+        "dataset_type": dataset_type,
         "objectives": [
             {"metric": "cash_out_risk_pct", "direction": "minimize"},
-            {"metric": "runway_months", "direction": "maximize"},
+            {"metric": "survival_score_pct", "direction": "maximize"},
         ],
-        "constraints": [{"kind": "emergency_floor", "params": {}}],
-        "change": {"type": "upfront", "params": {}},
+    }
+
+    try:
+        parsed = parse_financial_decision(text, baseline=instance, dataset_type=dataset_type)
+    except DecisionParseError as exc:
+        return {
+            **base,
+            "constraints": [],
+            "change": {"type": "upfront", "params": {}},
+            "financial": None,
+            "status": "needs_clarification",
+            "message": str(exc),
+        }
+
+    fin = dataclasses.asdict(parsed)
+    return {
+        **base,
+        "constraints": [
+            {"kind": "emergency_floor", "params": {"floor": fin["emergency_floor"]}},
+        ],
+        "change": {
+            "type": fin["financing_preference"],
+            "params": {
+                "item_name": fin["item_label"],
+                "total_cost": fin["total_cost"],
+                "emergency_floor": fin["emergency_floor"],
+                "target_month": fin["target_month"],
+                "emi_months": fin["emi_months"],
+                "quantity": fin["quantity"],
+            },
+        },
+        "financial": fin,
         "status": "ok",
         "message": None,
     }
 
 
-def call_generate_scenarios(decision_spec: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Calls D's build_forks(prompt, baseline, dataset_type) or reference scenario generator."""
-    # Try current API first
-    try:
-        import dataclasses
+# ---------------------------------------------------------------------------
+# 2. Scenario fan-out (baseline + 4 forks)
+# ---------------------------------------------------------------------------
 
-        from ai.agents.scenario import build_forks
-        prompt = decision_spec.get("text", "")
-        baseline = decision_spec.get("baseline", {})
-        dataset_type = decision_spec.get("dataset_type", "personal")
-        result = build_forks(prompt, baseline, dataset_type)
-        # build_forks returns a ForkSet dataclass with shape:
-        #   ForkSet.forks: List[ForkSpec] where ForkSpec has:
-        #     fork_id, title, policy_description, goal, status, infeasibility_reason
-        # Normalize to the pipeline dict shape expected by repository.save_scenarios:
-        #   {id, decision_id, parent_id, name, description, change, status}
-        if dataclasses.is_dataclass(result) and not isinstance(result, type):
-            result_dict = dataclasses.asdict(result)
-            raw_forks = result_dict.get("forks", [])
-            d_id = decision_spec["id"]
-            if raw_forks and isinstance(raw_forks, list) and isinstance(raw_forks[0], dict):
-                # Add a baseline node first
-                normalized = [{
-                    "id": "baseline",
-                    "decision_id": d_id,
-                    "parent_id": None,
-                    "name": "Baseline (Node 0 — Current Position)",
-                    "description": "Current financial state before any purchase decision.",
-                    "change": {"type": "baseline", "params": {}},
-                    "status": "queued",
-                }]
-                for f in raw_forks:
-                    fork_id = f.get("fork_id", "unknown")
-                    goal = f.get("goal") or {}
-                    normalized.append({
-                        "id": f"fork_{fork_id}",
-                        "decision_id": d_id,
-                        "parent_id": "baseline",
-                        "name": f.get("title", fork_id.replace("_", " ").title()),
-                        "description": f.get("policy_description", ""),
-                        "change": {
-                            "type": fork_id,  # upfront | emi | phased | trim
-                            "params": {
-                                k: v for k, v in goal.items()
-                                if k not in ("item_name", "financing_mode")
-                            },
-                        },
-                        "status": f.get("status", "queued") or "queued",
-                    })
-                return normalized
-        elif isinstance(result, list):
-            return result
-    except (ImportError, AttributeError, ModuleNotFoundError):
-        pass
+def scenario_id_for(decision_id: str, branch_type: str) -> str:
+    """Scenario ids are unique per decision so decisions never overwrite each other."""
+    return f"{decision_id}_{branch_type}"
 
-    d_id = decision_spec["id"]
-    change_params = decision_spec.get("change", {}).get("params", {})
 
-    # 4 competing FutureFork financial policy forks + baseline root
-    baseline = {
-        "id": "baseline",
+def call_generate_scenarios(
+    decision: Dict[str, Any],
+    instance: FinancialProblemInstance,
+) -> List[Dict[str, Any]]:
+    """Builds the baseline node plus the 4 policy forks for a decision."""
+    d_id = decision["id"]
+    fork_set = build_forks(
+        decision.get("text", ""),
+        instance,
+        decision.get("dataset_type", DEFAULT_DATASET_TYPE),
+    )
+
+    floor = float(getattr(fork_set.baseline_goal, "emergency_floor", 0.0) or 0.0)
+    scenarios: List[Dict[str, Any]] = [{
+        "id": scenario_id_for(d_id, "baseline"),
         "decision_id": d_id,
         "parent_id": None,
-        "name": "Baseline (Node 0 — Current Position)",
-        "description": "Current financial state before any purchase decision — establishes the 12-month cash-flow reference.",
-        "change": {"type": "baseline", "params": {}},
+        "name": "Baseline (Node 0)",
+        "description": "Your historical 12-month cash flow with no purchase and no spending changes.",
+        "change": {"type": "baseline", "params": {"emergency_floor": floor}},
         "status": "queued",
-    }
-    fork_upfront = {
-        "id": "fork_upfront",
-        "decision_id": d_id,
-        "parent_id": "baseline",
-        "name": "Fork A: Upfront Buy",
-        "description": "Single lump-sum purchase in Month 0. Highest immediate cash impact, zero interest.",
-        "change": {"type": "upfront", "params": change_params},
-        "status": "queued",
-    }
-    fork_emi = {
-        "id": "fork_emi",
-        "decision_id": d_id,
-        "parent_id": "baseline",
-        "name": "Fork B: EMI / Lease (12-Month)",
-        "description": "Spreads cost over 12 monthly instalments. Best runway and lowest cash-out risk.",
-        "change": {"type": "emi", "params": {**change_params, "months": 12}},
-        "status": "queued",
-    }
-    fork_phased = {
-        "id": "fork_phased",
-        "decision_id": d_id,
-        "parent_id": "baseline",
-        "name": "Fork C: Phased Split (50/50)",
-        "description": "50% paid in Month 0, 50% deferred to Month 6 — aligns with revenue peaks, zero interest.",
-        "change": {"type": "phased_delay", "params": {**change_params, "splits": [{"month": 0, "pct": 0.5}, {"month": 6, "pct": 0.5}]}},
-        "status": "queued",
-    }
-    fork_trim = {
-        "id": "fork_trim",
-        "decision_id": d_id,
-        "parent_id": "baseline",
-        "name": "Fork D: Trim-and-Buy",
-        "description": "Upfront purchase funded by 20-25% discretionary cuts (travel, marketing). Best survival score.",
-        "change": {"type": "discretionary_trim", "params": {**change_params, "max_cut_pct": 0.25}},
-        "status": "queued",
-    }
+    }]
 
-    return [baseline, fork_upfront, fork_emi, fork_phased, fork_trim]
+    for fork in fork_set.forks:
+        goal = fork.goal.to_dict() if hasattr(fork.goal, "to_dict") else dict(fork.goal or {})
+        ok = fork.status == "ready"
+        description = fork.policy_description
+        if not ok and fork.infeasibility_reason:
+            description = f"{description} Not evaluated: {fork.infeasibility_reason}"
+        scenarios.append({
+            "id": scenario_id_for(d_id, fork.fork_id),
+            "decision_id": d_id,
+            "parent_id": scenario_id_for(d_id, "baseline"),
+            "name": fork.title,
+            "description": description,
+            "change": {"type": fork.fork_id, "params": goal},
+            "status": "queued" if ok else "failed",
+        })
+    return scenarios
 
+
+# ---------------------------------------------------------------------------
+# 3. Evaluation (CP-SAT + Monte Carlo)
+# ---------------------------------------------------------------------------
 
 def call_evaluate_scenario(
-    dataset: Dict[str, Any],
-    baseline_timetable: List[Dict[str, Any]],
+    instance: FinancialProblemInstance,
     scenario: Dict[str, Any],
     n_sims: int = 300,
     seed: int = 42,
 ) -> Dict[str, Any]:
-    """Calls C's evaluate_scenario / evaluate_baseline or reference engine."""
-    sc_id = scenario["id"]
-    is_baseline = (sc_id == "baseline" or scenario.get("parent_id") is None)
-    change_type = scenario.get("change", {}).get("type", "")
+    """
+    Evaluates one scenario with the real engine and returns the raw engine result dict,
+    tagged with the scenario id, branch type and the dataset's category types.
+    Raises on failure; never returns placeholder numbers.
+    """
+    change = scenario.get("change") or {}
+    branch_type = str(change.get("type") or "")
+    result = evaluate_financial_branch(
+        instance,
+        branch_type,
+        change.get("params") or {},
+        n_sims=n_sims,
+        seed=seed,
+    )
+    raw = result.to_dict()
+    raw["scenario_id"] = scenario["id"]
+    raw["decision_id"] = scenario.get("decision_id")
+    raw["branch_type"] = result.branch_type
+    raw["category_types"] = dict(instance.category_types)
+    return raw
 
-    try:
-        from engine.solver import evaluate_baseline, evaluate_scenario
-        if is_baseline:
-            return evaluate_baseline(dataset, baseline_timetable, n_sims=n_sims, seed=seed)
-        return evaluate_scenario(dataset, baseline_timetable, scenario["change"], n_sims=n_sims, seed=seed)
-    except (ImportError, AttributeError, ModuleNotFoundError, ValueError, KeyError):
-        pass
 
-    # Reference Engine Execution — covers all 4 FutureFork branch types
-    if is_baseline:
-        summary_metrics = (
-            dataset.get("summary", {}).get("baseline_metrics", {})
-            or dataset.get("baseline_metrics", {})
-        )
+# ---------------------------------------------------------------------------
+# 4. Explanation (Numeric Guard enforced inside explain_branches)
+# ---------------------------------------------------------------------------
+
+def call_explain(decision: Dict[str, Any], raw_results: Dict[str, Any]) -> Dict[str, Any]:
+    """Explains the evaluated branches. raw_results: scenario_id -> raw engine result."""
+    if not raw_results:
         return {
-            "scenario_id": sc_id,
-            "solver": {"status": "FEASIBLE", "objective": 145.0, "runtime_s": 0.12},
-            "metrics": {
-                "cash_out_risk_pct": summary_metrics.get("cash_out_risk_pct", 12.0),
-                "p10_worst_balance": summary_metrics.get("p10_worst_balance", 18500.0),
-                "lowest_balance_month": summary_metrics.get("lowest_balance_month", 8),
-                "runway_months": summary_metrics.get("runway_months", 10),
-                "survival_score_pct": summary_metrics.get("survival_score_pct", 76.0),
-            },
-            "simulation": {
-                "n_runs": n_sims,
-                "per_metric": {
-                    "cash_out_risk_pct": {"mean": 12.5, "std": 2.1, "p10": 9.0, "p90": 16.0},
-                    "p10_worst_balance": {"mean": 18200.0, "std": 3100.0, "p10": 14000.0, "p90": 23000.0},
-                    "survival_score_pct": {"mean": 75.5, "std": 5.2, "p10": 68.0, "p90": 82.0},
-                },
-                "prob_cash_out": 0.12,
-            },
-            "timetable": baseline_timetable,
-            "explanation": "Baseline financial position: moderate cash-out risk of 12% with a 10-month runway under current spending patterns.",
+            "summary": "No scenarios have been evaluated yet.",
+            "source": "none",
+            "guard_passed": True,
+            "violations": [],
         }
 
-    # Branch 1: Upfront Buy
-    if change_type == "upfront":
-        return {
-            "scenario_id": sc_id,
-            "solver": {"status": "OPTIMAL", "objective": 198.0, "runtime_s": 0.45},
-            "metrics": {
-                "cash_out_risk_pct": 28.0,
-                "p10_worst_balance": 8200.0,
-                "lowest_balance_month": 2,
-                "runway_months": 7,
-                "survival_score_pct": 54.0,
-            },
-            "simulation": {
-                "n_runs": n_sims,
-                "per_metric": {
-                    "cash_out_risk_pct": {"mean": 29.5, "std": 4.1, "p10": 24.0, "p90": 36.0},
-                    "p10_worst_balance": {"mean": 7900.0, "std": 2200.0, "p10": 4800.0, "p90": 11500.0},
-                    "survival_score_pct": {"mean": 53.0, "std": 8.5, "p10": 42.0, "p90": 63.0},
-                },
-                "prob_cash_out": 0.28,
-            },
-            "timetable": baseline_timetable,
-            "explanation": "Upfront buy drains reserves immediately — highest cash-out risk (28%) and lowest runway (7 months) but zero interest cost.",
-        }
+    by_branch = {r.get("branch_type", sid): r for sid, r in raw_results.items()}
+    fin = decision.get("financial") or {}
+    parsed = SimpleNamespace(**fin) if fin else None
 
-    # Branch 2: EMI / Lease
-    if change_type in ("emi", "emi_split", "lease"):
-        return {
-            "scenario_id": sc_id,
-            "solver": {"status": "OPTIMAL", "objective": 36.0, "runtime_s": 0.38},
-            "metrics": {
-                "cash_out_risk_pct": 8.0,
-                "p10_worst_balance": 24500.0,
-                "lowest_balance_month": 6,
-                "runway_months": 12,
-                "survival_score_pct": 88.0,
-            },
-            "simulation": {
-                "n_runs": n_sims,
-                "per_metric": {
-                    "cash_out_risk_pct": {"mean": 8.5, "std": 1.8, "p10": 6.0, "p90": 11.5},
-                    "p10_worst_balance": {"mean": 24000.0, "std": 3500.0, "p10": 19000.0, "p90": 29500.0},
-                    "survival_score_pct": {"mean": 87.5, "std": 4.2, "p10": 81.0, "p90": 93.0},
-                },
-                "prob_cash_out": 0.08,
-            },
-            "timetable": baseline_timetable,
-            "explanation": "EMI spreads cost over 12 months — best survival score (88%) and lowest cash-out risk (8%), with manageable interest overhead.",
-        }
-
-    # Branch 3: Phased / Milestone Split
-    if change_type in ("phased_delay", "phased", "phased_split"):
-        return {
-            "scenario_id": sc_id,
-            "solver": {"status": "OPTIMAL", "objective": 48.0, "runtime_s": 0.52},
-            "metrics": {
-                "cash_out_risk_pct": 14.0,
-                "p10_worst_balance": 20100.0,
-                "lowest_balance_month": 4,
-                "runway_months": 11,
-                "survival_score_pct": 80.0,
-            },
-            "simulation": {
-                "n_runs": n_sims,
-                "per_metric": {
-                    "cash_out_risk_pct": {"mean": 14.8, "std": 2.9, "p10": 10.5, "p90": 19.0},
-                    "p10_worst_balance": {"mean": 19700.0, "std": 3200.0, "p10": 15200.0, "p90": 24800.0},
-                    "survival_score_pct": {"mean": 79.5, "std": 5.8, "p10": 71.0, "p90": 87.0},
-                },
-                "prob_cash_out": 0.14,
-            },
-            "timetable": baseline_timetable,
-            "explanation": "Phased 50/50 split eliminates interest cost while smoothing the cash impact across two revenue peaks — balanced risk (14%) with an 11-month runway.",
-        }
-
-    # Branch 4: Discretionary Trim / Trim-and-Buy
-    if change_type in ("discretionary_trim", "trim", "trim_and_buy"):
-        return {
-            "scenario_id": sc_id,
-            "solver": {"status": "OPTIMAL", "objective": 62.0, "runtime_s": 0.41},
-            "metrics": {
-                "cash_out_risk_pct": 6.0,
-                "p10_worst_balance": 27800.0,
-                "lowest_balance_month": 9,
-                "runway_months": 12,
-                "survival_score_pct": 92.0,
-            },
-            "simulation": {
-                "n_runs": n_sims,
-                "per_metric": {
-                    "cash_out_risk_pct": {"mean": 6.5, "std": 1.4, "p10": 4.5, "p90": 9.0},
-                    "p10_worst_balance": {"mean": 27200.0, "std": 2900.0, "p10": 23000.0, "p90": 32000.0},
-                    "survival_score_pct": {"mean": 91.5, "std": 3.5, "p10": 86.0, "p90": 96.0},
-                },
-                "prob_cash_out": 0.06,
-            },
-            "timetable": baseline_timetable,
-            "explanation": "Trim-and-Buy applies a 20-25% cut to flexible categories (travel, marketing) allowing upfront purchase with minimal financial stress — best survival score (92%).",
-        }
-
-    # Generic custom branch fallback
+    result = explain_branches(parsed, by_branch)
+    report = result.guard_report
     return {
-        "scenario_id": sc_id,
-        "solver": {"status": "OPTIMAL", "objective": 55.0, "runtime_s": 0.35},
+        "summary": result.text,
+        "source": result.source,
+        "guard_passed": bool(report.passed),
+        "violations": [dataclasses.asdict(v) for v in report.violations],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 5. API view: raw engine result -> FinancialScenarioResult contract
+# ---------------------------------------------------------------------------
+
+def to_api_result(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Projects a stored engine result into the FinancialScenarioResult API contract."""
+    metrics = raw.get("metrics") or {}
+    sim = raw.get("simulation_results") or {}
+    solver_meta = raw.get("solver_metadata") or {}
+    schedules = raw.get("monthly_schedules") or []
+    trajectories = sim.get("monthly_trajectories") or []
+    category_types = raw.get("category_types") or {}
+
+    months = [s.get("month_str", f"M{i + 1}") for i, s in enumerate(schedules)]
+    category_names: List[str] = list(category_types.keys())
+    for s in schedules:
+        for name in (s.get("category_outflows") or {}):
+            if name not in category_names:
+                category_names.append(name)
+
+    categories = [
+        {
+            "name": name,
+            "type": category_types.get(name, "fixed"),
+            "values": [float((s.get("category_outflows") or {}).get(name, 0.0)) for s in schedules],
+        }
+        for name in category_names
+    ]
+
+    def _single(value: Any) -> Dict[str, float]:
+        v = float(value or 0.0)
+        return {"mean": v, "std": 0.0, "p10": v, "p90": v}
+
+    lowest_dist = (sim.get("per_metric") or {}).get("lowest_balance") or {}
+    p10_worst = metrics.get("p10_lowest_balance", metrics.get("lowest_balance", 0.0))
+
+    return {
+        "scenario_id": raw.get("scenario_id"),
+        "decision_id": raw.get("decision_id"),
+        "branch_type": raw.get("branch_type"),
+        "name": raw.get("scenario_name"),
+        "is_feasible": bool(raw.get("is_feasible", False)),
+        "purchase_month": raw.get("purchase_month", -1),
+        "solver": {
+            "status": solver_meta.get("status", "UNKNOWN"),
+            "solver": solver_meta.get("solver"),
+            "runtime_s": float(solver_meta.get("runtime_s", 0.0)),
+        },
         "metrics": {
-            "cash_out_risk_pct": 15.0,
-            "p10_worst_balance": 19500.0,
-            "lowest_balance_month": 5,
-            "runway_months": 10,
-            "survival_score_pct": 78.0,
+            "cash_out_risk_pct": float(metrics.get("cash_out_risk_pct", 0.0)),
+            "floor_breach_risk_pct": float(metrics.get("floor_breach_risk_pct", 0.0)),
+            "survival_score_pct": float(metrics.get("survival_score_pct", 0.0)),
+            "p10_worst_balance": float(p10_worst),
+            "lowest_balance": float(metrics.get("lowest_balance", 0.0)),
+            "lowest_balance_month": str(metrics.get("lowest_balance_month", "")),
+            "months_below_floor": int(metrics.get("months_below_floor", 0)),
+            "runway_months": float(metrics.get("runway_months", 0.0)),
+            "ending_balance": float(metrics.get("ending_balance", 0.0)),
+            "emergency_floor": float(metrics.get("emergency_floor", 0.0)),
+            "total_purchase_cost": float(metrics.get("total_purchase_cost", 0.0)),
+            "total_financing_interest": float(metrics.get("total_financing_interest", 0.0)),
+            "total_trims_saved": float(metrics.get("total_trims_saved", 0.0)),
         },
         "simulation": {
-            "n_runs": n_sims,
+            "n_runs": int(sim.get("n_runs", 0)),
+            "prob_cash_out": float(sim.get("cash_out_risk_pct", 0.0)) / 100.0,
+            "monthly_balances": [float(s.get("closing_balance", 0.0)) for s in schedules],
+            "balance_p10": [float(t.get("p10", 0.0)) for t in trajectories],
+            "balance_p90": [float(t.get("p90", 0.0)) for t in trajectories],
             "per_metric": {
-                "cash_out_risk_pct": {"mean": 15.5, "std": 3.0, "p10": 11.0, "p90": 20.5},
-                "p10_worst_balance": {"mean": 19000.0, "std": 3400.0, "p10": 14500.0, "p90": 24000.0},
-                "survival_score_pct": {"mean": 77.5, "std": 6.0, "p10": 69.5, "p90": 86.0},
+                "cash_out_risk_pct": _single(metrics.get("cash_out_risk_pct")),
+                "survival_score_pct": _single(metrics.get("survival_score_pct")),
+                "runway_months": _single(metrics.get("runway_months")),
+                "p10_worst_balance": {
+                    "mean": float(lowest_dist.get("mean", p10_worst)),
+                    "std": 0.0,
+                    "p10": float(lowest_dist.get("p10", p10_worst)),
+                    "p90": float(lowest_dist.get("p90", p10_worst)),
+                },
             },
-            "prob_cash_out": 0.15,
         },
-        "timetable": baseline_timetable,
-        "explanation": "Custom branch evaluated against baseline financial position with moderate risk profile.",
+        "cash_flow": {
+            "months": months,
+            "inflows": [float(s.get("inflow", 0.0)) for s in schedules],
+            "purchase_cash_out": [float(s.get("purchase_cash_out", 0.0)) for s in schedules],
+            "categories": categories,
+        },
+        "category_trims": raw.get("category_trims") or {},
+        "explanation": None,
     }
 
 
-def call_explain(decision_spec: Dict[str, Any], results: Dict[str, Any]) -> Dict[str, Any]:
-    """Calls D's explain_branches(decision, branch_results) or reference explainer."""
-    # Try current API first
-    try:
-        import dataclasses
-
-        from ai.agents.explainer import explain_branches
-        result = explain_branches(decision_spec, results)
-        # explain_branches returns ExplanationResult dataclass — convert to dict
-        if dataclasses.is_dataclass(result) and not isinstance(result, type):
-            return dataclasses.asdict(result)
-        return result if isinstance(result, dict) else dict(result)
-    except (ImportError, AttributeError, ModuleNotFoundError):
-        pass
-
-    return {
-        "summary": "Analysis of 4 competing financial policy forks against the Baseline financial position reveals a clear risk-vs-liquidity trade-off.",
-        "tradeoffs": {
-            "baseline": "Current position with moderate cash-out risk (12%) and a 10-month runway under unchanged spending.",
-            "upfront": "Highest immediate cash drain — 28% cash-out risk, 7-month runway, but zero interest cost.",
-            "emi": "Best risk profile — 8% cash-out risk, full 12-month runway, with manageable EMI interest overhead.",
-            "phased_delay": "Balanced split eliminates interest, 14% risk, 11-month runway by aligning payments to revenue peaks.",
-            "discretionary_trim": "Lowest overall risk (6%) and highest survival score (92%) via 20-25% cuts to flexible spending.",
-        },
-        "recommendation": "EMI or Discretionary Trim are the recommended paths: both keep cash-out risk below 10%, maintain a 12-month runway, and preserve the emergency floor throughout the planning horizon.",
-        "model_generated": True,
-    }
+__all__ = [
+    "BRANCH_TYPES",
+    "load_instance",
+    "dataset_type_of",
+    "call_parse_decision",
+    "call_generate_scenarios",
+    "call_evaluate_scenario",
+    "call_explain",
+    "scenario_id_for",
+    "to_api_result",
+]

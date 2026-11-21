@@ -229,3 +229,22 @@ def test_defensive_encoding_and_malformed_csv():
     # Empty CSV should raise ValueError
     with pytest.raises(ValueError, match="CSV dataset is empty"):
         FinancialIngestor.compile(b"")
+
+
+def test_mixed_date_separators_are_not_dropped():
+    """A column mixing DD/MM/YYYY and DD-MM-YYYY must parse every row (regression)."""
+    import pandas as pd
+
+    from data.ingestor import parse_date_series
+
+    parsed = parse_date_series(pd.Series(["28/04/2024", "18-07-2024", "02-04-2024", "05.06.2024"]))
+    assert parsed.notna().all()
+    assert [d.month for d in parsed] == [4, 7, 4, 6]
+
+
+def test_personal_sample_keeps_all_salary_credits():
+    """The personal sample has a monthly salary credit; none may be lost to date parsing."""
+    from data.loader import load_sample_instance
+
+    inst = load_sample_instance("personal_upi.csv")
+    assert sum(inst.inflows) > 1_500_000  # 12 salary credits of ~₹1.45L each

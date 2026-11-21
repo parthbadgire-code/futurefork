@@ -24,14 +24,20 @@ jobs:
           pip install pytest ruff
       - name: Run Ruff Lint
         run: |
-          ruff check backend/ contracts/ data/ scripts/ engine/
-      - name: Generate Sample Data
-        run: |
-          python data/make_sample.py
-          python data/make_finance_samples.py
-      - name: Run Backend Tests
+          ruff check backend/ contracts/ data/ scripts/ engine/ ai/
+      - name: Run Backend & Engine Tests
         run: |
           python -m pytest backend/tests/ engine/tests/ -v
+      - name: Run E2E Pipeline
+        env:
+          FUTUREFORK_OFFLINE: "1"
+        run: |
+          python scripts/e2e.py
+      - name: Run AI Evaluation Suite
+        env:
+          FUTUREFORK_OFFLINE: "1"
+        run: |
+          python ai/evals/test_prompts.py
 
   frontend-build:
     name: Frontend Lint & Build

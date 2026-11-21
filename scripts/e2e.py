@@ -1,5 +1,5 @@
 """
-FutureFork End-to-End CLI Test — Member 5
+FutureFork End-to-End CLI Test
 Full pipeline: Upload CSV → Inspect → Commit Node 0 → Prompt Decision → 4 Branches → Compare
 
 Usage:
@@ -13,6 +13,7 @@ Done-condition: script exits with code 0 and prints "X PASSED, 0 FAILED".
 import argparse
 import asyncio
 import io
+import os
 import sys
 import time
 from pathlib import Path
@@ -20,6 +21,11 @@ from pathlib import Path
 # Add project root to sys.path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
+
+# In-process mode: use a throwaway database (never the developer's ./futurefork.db)
+if "--url" not in sys.argv and "DATABASE_URL" not in os.environ:
+    import tempfile
+    os.environ["DATABASE_URL"] = f"sqlite:///{Path(tempfile.mkdtemp(prefix='futurefork-e2e-')) / 'e2e.db'}"
 
 from backend.api import routes
 from backend.db.repository import SessionLocal, init_db
@@ -296,23 +302,19 @@ def run_e2e(base_url: str = None, csv_path: str = None):
         spec = client.create_decision(text=prompt, dataset_id=dataset_id)
         dec_id = spec.get("id", "")
         ok(bool(dec_id), "Decision spec has an id", str(spec.get("error", "")))
-        ok(spec.get("status") in ("ok", "needs_clarification", "unsupported"),
-           f"Status is valid ({spec.get('status')})")
-        # routes.py normalises "financial" → "change"; accept either schema
-        has_change = ("change" in spec and "type" in spec.get("change", {})) or "financial" in spec
-        ok(has_change, "Decision has change.type (or financial block)")
-        change_type = spec.get("change", {}).get("type") or spec.get("financial", {}).get("financing_preference", "n/a")
-        print(f"      decision_id = {dec_id}  |  change.type = {change_type}", flush=True)
+        ok(spec.get("status") == "ok", f"Decision parsed ({spec.get('status')})")
+        params = spec.get("change", {}).get("params", {})
+        ok(params.get("total_cost", 0) > 0, f"Parsed purchase cost ₹{params.get('total_cost', 0):,.0f}")
+        print(f"      decision_id = {dec_id}  |  preference = {spec.get('change', {}).get('type')}", flush=True)
 
         # ── 5. POST /decisions/{id}/scenarios ────────────────────────
         section("5. POST /decisions/{id}/scenarios  (4 Branches)")
         scenarios = client.generate_scenarios(dec_id)
-        ok(isinstance(scenarios, list) and len(scenarios) >= 1,
-           f"Generated ≥ 1 scenario (got {len(scenarios)})")
-        sc_ids = [s["id"] for s in scenarios]
-        ok("baseline" in sc_ids, "Baseline (Node 0) scenario present")
-        # Ideally 4 policy forks + baseline = 5, but ≥ 1 is enough for integration
-        print(f"      Scenarios: {sc_ids}", flush=True)
+        sc_types = [s["change"]["type"] for s in scenarios]
+        ok(sc_types == ["baseline", "upfront", "emi", "phased", "trim"],
+           f"Baseline + 4 forks generated ({sc_types})")
+        ok(all(s["status"] == "queued" for s in scenarios), "All forks ready to evaluate")
+        baseline_id = scenarios[0]["id"]
 
         # ── 6. POST /decisions/{id}/run ──────────────────────────────
         section("6. POST /decisions/{id}/run  (CP-SAT + Monte Carlo)")
@@ -332,33 +334,37 @@ def run_e2e(base_url: str = None, csv_path: str = None):
                 break
             time.sleep(0.4)
         print()
-        ok(run_data.get("overall_status") in ("done", "failed"),
+        ok(run_data.get("overall_status") == "done",
            f"Pipeline finished  status={run_data.get('overall_status')}")
+        ok(set((run_data.get("scenarios") or {}).values()) == {"done"},
+           "Every fork evaluated by CP-SAT + Monte Carlo")
 
         # ── 8. GET /decisions/{id}/compare ───────────────────────────
         section("8. GET /decisions/{id}/compare  (Side-by-Side + AI)")
         comp = client.get_comparison(dec_id)
         ok(comp.get("decision_id") == dec_id, "Comparison has correct decision_id")
         ok("scenarios" in comp, "Comparison has scenarios list")
-        ok("results" in comp, "Comparison has results dict")
-        ok("explanation" in comp, "Comparison has AI explanation")
+        results = comp.get("results", {})
+        ok(len(results) == 5, f"Comparison has 5 results (got {len(results)})")
+        for r in results.values():
+            m = r["metrics"]
+            print(f"      {r['branch_type']:<9} survival {m['survival_score_pct']:5.1f}%  "
+                  f"cash-out risk {m['cash_out_risk_pct']:5.1f}%  runway {m['runway_months']:4.1f} mo",
+                  flush=True)
+        explanation = comp.get("explanation", {})
+        ok(bool(explanation.get("summary")), "Comparison has an explanation")
+        ok(explanation.get("guard_passed") is True, "Explanation passed the Numeric Guard")
 
         # ── 9. POST /scenarios/{id}/branch ───────────────────────────
         section("9. POST /scenarios/{id}/branch  (Phase-2 Child Fork)")
-        try:
-            child = client.branch_scenario(
-                parent_id="baseline",
-                name="Custom: Delay Purchase 2 Months",
-                change={"type": "phased_delay", "params": {"delay_months": 2, "split_pct": 50}},
-            )
-            ok(child.get("parent_id") == "baseline",
-               "Child scenario has correct parent_id")
-            ok(child.get("id", "").startswith("branch_"),
-               "Child scenario id starts with 'branch_'")
-        except Exception as exc:
-            # 404 is acceptable when baseline isn't yet flushed to DB
-            ok("PARENT_NOT_FOUND" in str(exc) or "404" in str(exc),
-               "Branch 404 (baseline not yet in DB) — acceptable")
+        child = client.branch_scenario(
+            parent_id=baseline_id,
+            name="Custom: 12-month EMI",
+            change={"type": "emi", "params": {"emi_months": 12}},
+        )
+        ok(child.get("parent_id") == baseline_id, "Child scenario has correct parent_id")
+        ok(child.get("id", "").startswith("branch_"), "Child scenario id starts with 'branch_'")
+        ok(child.get("status") == "done", f"Child fork evaluated ({child.get('status')})")
 
         # ── 10. Multi-prompt smoke test ──────────────────────────────
         section("10. Multi-Prompt Smoke Test  (6 prompts × 3 user types)")
@@ -366,7 +372,7 @@ def run_e2e(base_url: str = None, csv_path: str = None):
             try:
                 spec2 = client.create_decision(text=prompt, dataset_id=dataset_id)
                 ok(
-                    spec2.get("status") in ("ok", "needs_clarification", "unsupported"),
+                    spec2.get("status") == "ok",
                     f"Prompt parsed: \"{prompt[:55]}…\"",
                 )
             except Exception as exc2:
@@ -391,7 +397,7 @@ def run_e2e(base_url: str = None, csv_path: str = None):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="FutureFork E2E Test Suite — Member 5")
+    parser = argparse.ArgumentParser(description="FutureFork E2E Test Suite")
     parser.add_argument("--url", type=str, default=None,
                         help="Base URL of deployed API (omit for in-process mode)")
     parser.add_argument("--csv", type=str, default=None,

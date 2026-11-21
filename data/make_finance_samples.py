@@ -720,14 +720,6 @@ def main() -> None:
     generate_institute_fixture_json(p2, fix_path)
     print(f"   [DONE] Compiled {fix_path.name} ({fix_path.stat().st_size:,} bytes)")
 
-    # Also keep synced copies in data/sample/ so any module checking either path finds them
-    sample_dir = DATA_DIR / "sample"
-    if sample_dir.exists():
-        for src in [p1, p2, p3, fix_path]:
-            dest = sample_dir / src.name
-            dest.write_bytes(src.read_bytes())
-        print(f"   [SYNC] Synced sample copies to {sample_dir}/")
-
     print("=" * 65)
     print("All financial datasets generated successfully!")
     print("=" * 65)

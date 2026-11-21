@@ -84,11 +84,9 @@ class ResultModel(Base):
     __tablename__ = "results"
 
     scenario_id = Column(String(100), primary_key=True, index=True)
-    solver      = Column(JSON, nullable=False)
-    metrics     = Column(JSON, nullable=False)
-    simulation  = Column(JSON, nullable=False)
-    timetable   = Column(JSON, nullable=False)
-    explanation = Column(Text, nullable=True)
+    decision_id = Column(String(100), nullable=True, index=True)
+    branch_type = Column(String(50), nullable=True)
+    payload     = Column(JSON, nullable=False)   # raw engine ScenarioEvaluationResult dict
     created_at  = Column(DateTime, default=func.now())
 
 

@@ -11,7 +11,6 @@ Public API:
   parse_indian_amount(text: str) -> float | None
 
 Backward compat:
-  parse_decision(text, dataset_summary) -> dict  (old timetable stub)
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("futurefork.ai.agents.parser")
 
@@ -438,6 +437,7 @@ def _llm_parse(
 
     try:
         from pydantic import BaseModel
+
         from ai.llm import call_structured_llm
 
         class _ParseSchema(BaseModel):
@@ -535,60 +535,3 @@ def parse_financial_decision(
         )
 
     return result
-
-
-# ===========================================================================
-# Backward compatibility stub (old timetable parser)
-# ===========================================================================
-
-
-def parse_decision(text: str, dataset_summary: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    DEPRECATED stub kept for backward compatibility with old timetable routes.
-    The old parse_decision interface remains importable but emits a deprecation warning.
-    """
-    import warnings
-    warnings.warn(
-        "parse_decision() is deprecated. Use parse_financial_decision() instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-
-    lower = text.lower()
-    is_financial = any(
-        k in lower
-        for k in ["₹", "rs ", "inr", "lakh", "crore", "buy", "purchase", "invest", "hire"]
-    )
-
-    if is_financial:
-        try:
-            parsed = parse_financial_decision(text, dataset_type="personal")
-            return {
-                "id": f"dec_{abs(hash(text)) % 1000000}",
-                "text": text,
-                "dataset_id": dataset_summary.get("id", "unknown"),
-                "status": "ok",
-                "financial": {
-                    "item_label": parsed.item_label,
-                    "total_cost": parsed.total_cost,
-                    "emergency_floor": parsed.emergency_floor,
-                    "financing_preference": parsed.financing_preference,
-                },
-            }
-        except DecisionParseError:
-            pass
-
-    # Old timetable fallback
-    return {
-        "id": f"dec_{abs(hash(text)) % 1000000}",
-        "text": text,
-        "dataset_id": dataset_summary.get("id", "sample_univ_v1"),
-        "objectives": [{"metric": "student_clashes", "direction": "minimize"}],
-        "constraints": [],
-        "change": {
-            "type": "shift_time_window",
-            "params": {"from": "afternoon", "to": "morning", "selection": "all"},
-        },
-        "status": "ok",
-        "message": None,
-    }

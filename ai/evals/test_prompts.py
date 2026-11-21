@@ -15,7 +15,7 @@ import os
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 # Always run offline for deterministic tests
 os.environ.setdefault("FUTUREFORK_OFFLINE", "1")
@@ -29,22 +29,17 @@ if str(_REPO_ROOT) not in sys.path:
 # Imports (after path setup)
 # ===========================================================================
 
-from engine.model import ColumnMapping, PurchaseGoal, ScenarioEvaluationResult
-from engine.solver import solve_all_financial_scenarios
-from data.loader import load_sample_instance, load_sample_csv_bytes
-from data.ingestor import FinancialIngestor
-from ai.agents.mapper import propose_mapping, MappingResult
-from ai.agents.parser import parse_financial_decision, parse_indian_amount, ParsedDecision
-from ai.agents.scenario import build_forks, ForkSet
 from ai.agents.explainer import (
+    _build_allowed_facts,
     explain_branches,
     run_numeric_guard,
-    fmt_inr,
-    fmt_inr_lakh,
-    _build_allowed_facts,
-    GuardReport,
-    Violation,
 )
+from ai.agents.mapper import propose_mapping
+from ai.agents.parser import ParsedDecision, parse_financial_decision, parse_indian_amount
+from ai.agents.scenario import ForkSet, build_forks
+from data.loader import load_sample_csv_bytes, load_sample_instance
+from engine.model import ColumnMapping, PurchaseGoal, ScenarioEvaluationResult
+from engine.solver import solve_all_financial_scenarios
 
 # ===========================================================================
 # Test prompt definitions
@@ -376,7 +371,7 @@ def test_numeric_guard_violations() -> None:
     Craft an explanation with fabricated ₹99L, 42%, Month 11 → guard must flag all 3.
     """
     # Build a minimal branch_results with known values (survival=75%, lowest_balance=50000)
-    from engine.model import ScenarioEvaluationResult, MonthlyCashSchedule
+    from engine.model import MonthlyCashSchedule, ScenarioEvaluationResult
 
     # Build dummy schedules
     dummy_schedules = [
@@ -438,9 +433,9 @@ def test_numeric_guard_pass() -> None:
     """
     Template explanation from real branch_results must pass with 0 violations.
     """
-    from engine.model import ScenarioEvaluationResult, MonthlyCashSchedule
     from ai.agents.explainer import _build_template_explanation
     from ai.agents.parser import ParsedDecision
+    from engine.model import MonthlyCashSchedule, ScenarioEvaluationResult
 
     # Build a realistic set of branch_results
     def _make_result(fid: str, survival: float, risk: float, lb: float) -> ScenarioEvaluationResult:

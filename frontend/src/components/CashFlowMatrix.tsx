@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { FinancialScenarioResult, CashFlowTimetable } from '../contracts/types';
+import { FinancialScenarioResult, CashFlowMatrixData } from '../contracts/types';
 import { Lock, Unlock, Eye, GitCompare } from 'lucide-react';
 
 interface CashFlowMatrixProps {
@@ -56,35 +56,35 @@ export const CashFlowMatrix: React.FC<CashFlowMatrixProps> = ({ result, baseline
     );
   }
 
-  const { timetable } = result;
-  const baselineTimetable: CashFlowTimetable | null = baselineResult?.timetable ?? null;
+  const cashFlow = result.cash_flow;
+  const baselineCashFlow: CashFlowMatrixData | null = baselineResult?.cash_flow ?? null;
 
   // Max per category for colour scaling
-  const maxValues = timetable.categories.reduce<Record<string, number>>((acc, cat) => {
+  const maxValues = cashFlow.categories.reduce<Record<string, number>>((acc, cat) => {
     acc[cat.name] = Math.max(...cat.values, 1);
     return acc;
   }, {});
 
   const isChanged = (catName: string, monthIdx: number): boolean => {
-    if (!baselineTimetable) return false;
-    const baseCat = baselineTimetable.categories.find(c => c.name === catName);
-    const curCat = timetable.categories.find(c => c.name === catName);
+    if (!baselineCashFlow) return false;
+    const baseCat = baselineCashFlow.categories.find(c => c.name === catName);
+    const curCat = cashFlow.categories.find(c => c.name === catName);
     if (!baseCat || !curCat) return false;
     return baseCat.values[monthIdx] !== curCat.values[monthIdx];
   };
 
   const getDelta = (catName: string, monthIdx: number): number => {
-    if (!baselineTimetable) return 0;
-    const baseCat = baselineTimetable.categories.find(c => c.name === catName);
-    const curCat = timetable.categories.find(c => c.name === catName);
+    if (!baselineCashFlow) return 0;
+    const baseCat = baselineCashFlow.categories.find(c => c.name === catName);
+    const curCat = cashFlow.categories.find(c => c.name === catName);
     if (!baseCat || !curCat) return 0;
     return curCat.values[monthIdx] - baseCat.values[monthIdx];
   };
 
-  const fixedCats = timetable.categories.filter(c => c.type === 'fixed');
-  const flexCats  = timetable.categories.filter(c => c.type === 'flexible');
+  const fixedCats = cashFlow.categories.filter(c => c.type === 'fixed');
+  const flexCats  = cashFlow.categories.filter(c => c.type === 'flexible');
 
-  const renderCell = (cat: CashFlowTimetable['categories'][0], monthIdx: number, key: string) => {
+  const renderCell = (cat: CashFlowMatrixData['categories'][0], monthIdx: number, key: string) => {
     const val = cat.values[monthIdx];
     const changed = showDiff && isChanged(cat.name, monthIdx);
     const delta = showDiff ? getDelta(cat.name, monthIdx) : 0;
@@ -105,7 +105,7 @@ export const CashFlowMatrix: React.FC<CashFlowMatrixProps> = ({ result, baseline
                     hover:opacity-100 hover:ring-1 hover:ring-inset hover:ring-white/30`}
         onMouseEnter={(e) => {
           const rect = (e.target as HTMLElement).getBoundingClientRect();
-          setTooltip({ x: rect.left, y: rect.top - 60, category: cat.name, month: timetable.months[monthIdx], value: val, delta });
+          setTooltip({ x: rect.left, y: rect.top - 60, category: cat.name, month: cashFlow.months[monthIdx], value: val, delta });
           setHighlightedMonth(monthIdx);
         }}
         onMouseLeave={() => { setTooltip(null); setHighlightedMonth(null); }}
@@ -120,7 +120,7 @@ export const CashFlowMatrix: React.FC<CashFlowMatrixProps> = ({ result, baseline
     );
   };
 
-  const renderCategoryGroup = (cats: CashFlowTimetable['categories'], isFixed: boolean) => (
+  const renderCategoryGroup = (cats: CashFlowMatrixData['categories'], isFixed: boolean) => (
     <>
       {cats.map((cat) => (
         <tr key={cat.name} className="border-b border-white/5 hover:bg-white/3 group">
@@ -134,7 +134,7 @@ export const CashFlowMatrix: React.FC<CashFlowMatrixProps> = ({ result, baseline
               {cat.name}
             </div>
           </td>
-          {timetable.months.map((_, mIdx) => renderCell(cat, mIdx, `${cat.name}-${mIdx}`))}
+          {cashFlow.months.map((_, mIdx) => renderCell(cat, mIdx, `${cat.name}-${mIdx}`))}
         </tr>
       ))}
     </>
@@ -175,7 +175,7 @@ export const CashFlowMatrix: React.FC<CashFlowMatrixProps> = ({ result, baseline
               <th className="py-2 pl-4 pr-3 text-left text-xs font-semibold text-slate-500 sticky left-0 bg-[#0F1623] z-10 w-28 border-r border-white/8">
                 Category
               </th>
-              {timetable.months.map((m, i) => (
+              {cashFlow.months.map((m, i) => (
                 <th
                   key={m}
                   className={`text-center text-[10px] font-semibold py-2 px-1 text-slate-500 cursor-pointer

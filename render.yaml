@@ -12,10 +12,11 @@ services:
         value: 8000
       - key: ENVIRONMENT
         value: production
+      # Set to your deployed frontend origin(s), comma-separated
       - key: CORS_ORIGINS
-        value: "*"
-      - key: SOLVER_TIME_LIMIT_SECONDS
-        value: 8
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
       - key: NUM_SIMULATION_RUNS
         value: 300
       - key: RANDOM_SEED

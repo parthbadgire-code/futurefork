@@ -2,27 +2,20 @@
   "openapi": "3.1.0",
   "info": {
     "title": "FutureFork API",
-    "description": "Drop Your CSV, Fork Your Financial Future — CP-SAT + Monte Carlo financial scenario engine.",
-    "version": "2.0.0"
+    "description": "Financial decision forking: CP-SAT cash-flow optimization and Monte Carlo stress tests.",
+    "version": "0.1.0"
   },
   "paths": {
     "/health": {
       "get": {
         "summary": "Health Check",
-        "operationId": "health_check",
+        "operationId": "health_check_health_get",
         "responses": {
           "200": {
-            "description": "Service liveness",
+            "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "status":  { "type": "string", "example": "ok" },
-                    "service": { "type": "string" },
-                    "engine":  { "type": "string" }
-                  }
-                }
+                "schema": {}
               }
             }
           }
@@ -31,23 +24,30 @@
     },
     "/ping": {
       "get": {
-        "summary": "Keep-Warm Ping",
-        "operationId": "keep_warm_ping",
+        "summary": "Keep Warm Ping",
+        "operationId": "keep_warm_ping_ping_get",
         "responses": {
-          "200": { "description": "Pong", "content": { "application/json": { "schema": {} } } }
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
         }
       }
     },
     "/datasets": {
       "get": {
-        "summary": "List committed datasets",
-        "operationId": "list_datasets",
+        "summary": "List Datasets",
+        "operationId": "list_datasets_datasets_get",
         "responses": {
           "200": {
-            "description": "Array of dataset summaries",
+            "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/DatasetSummary" } }
+                "schema": {}
               }
             }
           }
@@ -56,316 +56,1119 @@
     },
     "/datasets/{dataset_id}": {
       "get": {
-        "summary": "Get dataset Node-0 baseline",
-        "operationId": "get_dataset",
+        "summary": "Get Dataset",
+        "operationId": "get_dataset_datasets__dataset_id__get",
         "parameters": [
-          { "name": "dataset_id", "in": "path", "required": true, "schema": { "type": "string" } }
+          {
+            "name": "dataset_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Dataset Id"
+            }
+          }
         ],
         "responses": {
-          "200": { "description": "Dataset summary", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DatasetSummary" } } } },
-          "404": { "description": "Dataset not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
         }
       }
     },
     "/datasets/inspect": {
       "post": {
-        "summary": "Upload CSV → get proposed ColumnMapping + 5-row preview",
-        "operationId": "inspect_dataset",
+        "summary": "Inspect Dataset",
+        "description": "Reads the uploaded CSV, proposes a ColumnMapping, and returns a 5-row preview.\nRaw bytes are held for 15 minutes under a fresh upload_id.",
+        "operationId": "inspect_dataset_datasets_inspect_post",
         "requestBody": {
-          "required": true,
           "content": {
             "multipart/form-data": {
               "schema": {
-                "type": "object",
-                "properties": {
-                  "file": { "type": "string", "format": "binary", "description": "Financial CSV file (bank/UPI/ERP/P&L)" }
-                },
-                "required": ["file"]
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Inspection result with upload_id cached for 15 minutes",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/InspectResponse" }
+                "$ref": "#/components/schemas/Body_inspect_dataset_datasets_inspect_post"
               }
             }
           },
-          "400": { "description": "Empty or unreadable CSV", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
         }
       }
     },
     "/datasets/commit": {
       "post": {
-        "summary": "Confirm mapping → ingest CSV → save Node 0 baseline",
-        "operationId": "commit_dataset",
+        "summary": "Commit Dataset",
+        "description": "Compiles the uploaded CSV into a 12-month baseline (Node 0) and saves it as a dataset.",
+        "operationId": "commit_dataset_datasets_commit_post",
         "requestBody": {
-          "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/CommitRequest" }
-            }
-          }
-        },
-        "responses": {
-          "201": {
-            "description": "Dataset committed; Node 0 baseline evaluated",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/CommitResponse" }
+              "schema": {
+                "$ref": "#/components/schemas/CommitRequest"
               }
             }
           },
-          "404": { "description": "upload_id not found or expired", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
-          "422": { "description": "CSV compilation failed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
         }
       }
     },
     "/decisions": {
       "post": {
-        "summary": "Parse financial decision prompt → 4 policy fork specs",
-        "operationId": "create_decision",
+        "summary": "Create Decision",
+        "operationId": "create_decision_decisions_post",
         "requestBody": {
-          "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/CreateDecisionRequest" }
+              "schema": {
+                "$ref": "#/components/schemas/CreateDecisionRequest"
+              }
             }
-          }
+          },
+          "required": true
         },
         "responses": {
-          "201": { "description": "DecisionSpec with 4 competing policy forks", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DecisionSpec" } } } },
-          "404": { "description": "Dataset not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
         }
       }
     },
     "/decisions/{decision_id}/scenarios": {
       "post": {
-        "summary": "Generate 4 competing scenario branches for a decision",
-        "operationId": "generate_scenarios",
+        "summary": "Generate Scenarios Endpoint",
+        "operationId": "generate_scenarios_endpoint_decisions__decision_id__scenarios_post",
         "parameters": [
-          { "name": "decision_id", "in": "path", "required": true, "schema": { "type": "string" } }
+          {
+            "name": "decision_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Decision Id"
+            }
+          }
         ],
         "responses": {
-          "200": { "description": "List of scenarios (baseline + 4 policy forks)", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Scenario" } } } } },
-          "404": { "description": "Decision not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Scenario"
+                  },
+                  "title": "Response Generate Scenarios Endpoint Decisions  Decision Id  Scenarios Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
         }
       }
     },
     "/decisions/{decision_id}/run": {
       "post": {
-        "summary": "Run CP-SAT solver + Monte Carlo simulation on all branches",
-        "operationId": "start_run",
+        "summary": "Start Run",
+        "operationId": "start_run_decisions__decision_id__run_post",
         "parameters": [
-          { "name": "decision_id", "in": "path", "required": true, "schema": { "type": "string" } }
+          {
+            "name": "decision_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Decision Id"
+            }
+          }
         ],
         "responses": {
-          "200": { "description": "Run dispatched", "content": { "application/json": { "schema": { "type": "object", "properties": { "run_id": { "type": "string" } } } } } },
-          "404": { "description": "Decision not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }
-        }
-      }
-    },
-    "/decisions/{decision_id}/compare": {
-      "get": {
-        "summary": "Side-by-side comparison of 4 branches + AI explanation (Regex Numeric Guard verified)",
-        "operationId": "get_comparison",
-        "parameters": [
-          { "name": "decision_id", "in": "path", "required": true, "schema": { "type": "string" } }
-        ],
-        "responses": {
-          "200": { "description": "Comparison payload with AI recommendation", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ComparisonResponse" } } } },
-          "404": { "description": "Decision not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
         }
       }
     },
     "/runs/{run_id}": {
       "get": {
-        "summary": "Poll run status",
-        "operationId": "get_run_status",
+        "summary": "Get Run Status",
+        "operationId": "get_run_status_runs__run_id__get",
         "parameters": [
-          { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string" } }
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
         ],
         "responses": {
-          "200": { "description": "Run status", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RunStatus" } } } },
-          "404": { "description": "Run not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunStatus"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
         }
       }
     },
     "/scenarios/{scenario_id}/result": {
       "get": {
-        "summary": "Fetch single branch result (solver + Monte Carlo metrics)",
-        "operationId": "get_scenario_result",
+        "summary": "Get Scenario Result",
+        "operationId": "get_scenario_result_scenarios__scenario_id__result_get",
         "parameters": [
-          { "name": "scenario_id", "in": "path", "required": true, "schema": { "type": "string" } }
+          {
+            "name": "scenario_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Scenario Id"
+            }
+          }
         ],
         "responses": {
-          "200": { "description": "Scenario evaluation result", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScenarioResult" } } } },
-          "404": { "description": "Result not found or not yet ready", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FinancialScenarioResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/decisions/{decision_id}/compare": {
+      "get": {
+        "summary": "Get Decision Comparison",
+        "operationId": "get_decision_comparison_decisions__decision_id__compare_get",
+        "parameters": [
+          {
+            "name": "decision_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Decision Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComparisonResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
         }
       }
     },
     "/scenarios/{parent_scenario_id}/branch": {
       "post": {
-        "summary": "Phase-2: Create a user-defined child scenario branch",
-        "operationId": "branch_scenario",
+        "summary": "Branch Scenario Endpoint",
+        "operationId": "branch_scenario_endpoint_scenarios__parent_scenario_id__branch_post",
         "parameters": [
-          { "name": "parent_scenario_id", "in": "path", "required": true, "schema": { "type": "string" } }
+          {
+            "name": "parent_scenario_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Parent Scenario Id"
+            }
+          }
         ],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/BranchScenarioRequest" }
+              "schema": {
+                "$ref": "#/components/schemas/BranchScenarioRequest"
+              }
             }
           }
         },
         "responses": {
-          "201": { "description": "Child scenario created and evaluated", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Scenario" } } } },
-          "404": { "description": "Parent scenario not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Scenario"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
         }
       }
     }
   },
   "components": {
     "schemas": {
-      "ApiError": {
-        "type": "object",
+      "Body_inspect_dataset_datasets_inspect_post": {
         "properties": {
-          "error":   { "type": "string" },
-          "message": { "type": "string" }
-        }
-      },
-      "ColumnMapping": {
+          "file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "description": "Financial CSV file (bank/UPI/ERP/P&L)"
+          }
+        },
         "type": "object",
-        "description": "Column header mapping for financial CSV parsing",
-        "properties": {
-          "date_col":        { "type": "string" },
-          "amount_col":      { "type": "string", "nullable": true },
-          "debit_col":       { "type": "string", "nullable": true },
-          "credit_col":      { "type": "string", "nullable": true },
-          "category_col":    { "type": "string", "nullable": true },
-          "description_col": { "type": "string", "nullable": true },
-          "type_col":        { "type": "string", "nullable": true },
-          "date_format":     { "type": "string", "nullable": true },
-          "starting_balance":{ "type": "number", "default": 0.0 }
-        }
-      },
-      "InspectResponse": {
-        "type": "object",
-        "properties": {
-          "upload_id":        { "type": "string", "description": "15-min TTL cache key" },
-          "filename":         { "type": "string" },
-          "proposed_mapping": { "$ref": "#/components/schemas/ColumnMapping" },
-          "preview_rows":     { "type": "array", "items": { "type": "object" }, "maxItems": 5 },
-          "ttl_seconds":      { "type": "integer", "example": 900 },
-          "message":          { "type": "string" }
-        }
-      },
-      "CommitRequest": {
-        "type": "object",
-        "required": ["upload_id", "confirmed_mapping"],
-        "properties": {
-          "upload_id":          { "type": "string" },
-          "confirmed_mapping":  { "$ref": "#/components/schemas/ColumnMapping" },
-          "dataset_name":       { "type": "string", "nullable": true },
-          "starting_balance":   { "type": "number", "nullable": true, "description": "Override starting ₹ balance" }
-        }
-      },
-      "CommitResponse": {
-        "type": "object",
-        "properties": {
-          "dataset_id":       { "type": "string" },
-          "name":             { "type": "string" },
-          "stats":            { "type": "object" },
-          "baseline_metrics": { "type": "object" },
-          "baseline_risks":   { "type": "object" },
-          "message":          { "type": "string" }
-        }
-      },
-      "DatasetSummary": {
-        "type": "object",
-        "properties": {
-          "id":               { "type": "string" },
-          "name":             { "type": "string" },
-          "description":      { "type": "string" },
-          "stats":            { "type": "object" },
-          "baseline_metrics": { "type": "object" }
-        }
-      },
-      "CreateDecisionRequest": {
-        "type": "object",
-        "required": ["text", "dataset_id"],
-        "properties": {
-          "text":       { "type": "string", "description": "Plain-English financial decision prompt" },
-          "dataset_id": { "type": "string" }
-        }
-      },
-      "DecisionSpec": {
-        "type": "object",
-        "properties": {
-          "id":         { "type": "string" },
-          "text":       { "type": "string" },
-          "dataset_id": { "type": "string" },
-          "objectives": { "type": "array", "items": { "type": "object" } },
-          "constraints":{ "type": "array", "items": { "type": "object" } },
-          "change":     { "type": "object", "properties": { "type": { "type": "string" }, "params": { "type": "object" } } },
-          "status":     { "type": "string", "enum": ["ok", "needs_clarification", "unsupported"] },
-          "message":    { "type": "string", "nullable": true }
-        }
-      },
-      "Scenario": {
-        "type": "object",
-        "properties": {
-          "id":          { "type": "string" },
-          "decision_id": { "type": "string" },
-          "parent_id":   { "type": "string", "nullable": true },
-          "name":        { "type": "string" },
-          "description": { "type": "string" },
-          "change":      { "type": "object" },
-          "status":      { "type": "string", "enum": ["queued", "running", "done", "failed"] }
-        }
-      },
-      "RunStatus": {
-        "type": "object",
-        "properties": {
-          "run_id":           { "type": "string" },
-          "decision_id":      { "type": "string" },
-          "overall_status":   { "type": "string", "enum": ["queued", "running", "done", "failed"] },
-          "progress_percent": { "type": "number" },
-          "scenarios":        { "type": "object", "description": "Dict[scenario_id → status]" }
-        }
-      },
-      "ScenarioResult": {
-        "type": "object",
-        "properties": {
-          "scenario_id": { "type": "string" },
-          "solver":      { "type": "object", "properties": { "status": { "type": "string" }, "objective": { "type": "number" }, "runtime_s": { "type": "number" } } },
-          "metrics":     { "type": "object", "description": "Financial risk metrics: cash_out_risk_pct, p10_lowest_balance, runway_months, survival_score_pct" },
-          "simulation":  { "type": "object", "description": "Monte Carlo 300-run results" },
-          "timetable":   { "type": "array", "items": { "type": "object" }, "description": "12-month cash schedule" },
-          "explanation": { "type": "string", "nullable": true }
-        }
-      },
-      "ComparisonResponse": {
-        "type": "object",
-        "properties": {
-          "decision_id":   { "type": "string" },
-          "decision_spec": { "$ref": "#/components/schemas/DecisionSpec" },
-          "scenarios":     { "type": "array", "items": { "$ref": "#/components/schemas/Scenario" } },
-          "results":       { "type": "object", "description": "Dict[scenario_id → ScenarioResult]" },
-          "explanation":   { "type": "object", "description": "AI recommendation (Regex Numeric Guard verified)" }
-        }
+        "required": [
+          "file"
+        ],
+        "title": "Body_inspect_dataset_datasets_inspect_post"
       },
       "BranchScenarioRequest": {
-        "type": "object",
-        "required": ["name", "change"],
         "properties": {
-          "name":   { "type": "string" },
-          "change": { "type": "object" }
-        }
+          "name": {
+            "type": "string",
+            "title": "Name",
+            "description": "Name for the new child scenario"
+          },
+          "change": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Change",
+            "description": "ChangeSpec: {type: upfront|emi|phased|trim, params: {...overrides}}"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "change"
+        ],
+        "title": "BranchScenarioRequest"
+      },
+      "CashFlowCategory": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "fixed",
+              "flexible"
+            ],
+            "title": "Type"
+          },
+          "values": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array",
+            "title": "Values",
+            "description": "Outflow per month (\u20b9), after any trims"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "type",
+          "values"
+        ],
+        "title": "CashFlowCategory"
+      },
+      "CashFlowMatrix": {
+        "properties": {
+          "months": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Months"
+          },
+          "inflows": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array",
+            "title": "Inflows"
+          },
+          "purchase_cash_out": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array",
+            "title": "Purchase Cash Out"
+          },
+          "categories": {
+            "items": {
+              "$ref": "#/components/schemas/CashFlowCategory"
+            },
+            "type": "array",
+            "title": "Categories"
+          }
+        },
+        "type": "object",
+        "required": [
+          "months",
+          "inflows",
+          "purchase_cash_out",
+          "categories"
+        ],
+        "title": "CashFlowMatrix"
+      },
+      "ChangeSpec": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "title": "Type",
+            "description": "baseline | upfront | emi | phased | trim"
+          },
+          "params": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Params",
+            "description": "PurchaseGoal fields"
+          }
+        },
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "title": "ChangeSpec"
+      },
+      "CommitRequest": {
+        "properties": {
+          "upload_id": {
+            "type": "string",
+            "title": "Upload Id",
+            "description": "upload_id returned by /datasets/inspect"
+          },
+          "confirmed_mapping": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Confirmed Mapping",
+            "description": "Confirmed ColumnMapping (from the inspect response, optionally edited)"
+          },
+          "dataset_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dataset Name",
+            "description": "Human-friendly name for the dataset"
+          },
+          "starting_balance": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Starting Balance",
+            "description": "Opening cash balance (\u20b9). Overrides any balance inferred from the CSV."
+          },
+          "dataset_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dataset Type",
+            "description": "personal | institute | startup (defaults to the type detected at inspect)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "upload_id",
+          "confirmed_mapping"
+        ],
+        "title": "CommitRequest"
+      },
+      "ComparisonResponse": {
+        "properties": {
+          "decision_id": {
+            "type": "string",
+            "title": "Decision Id"
+          },
+          "decision_spec": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Decision Spec"
+          },
+          "scenarios": {
+            "items": {
+              "$ref": "#/components/schemas/Scenario"
+            },
+            "type": "array",
+            "title": "Scenarios"
+          },
+          "results": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/FinancialScenarioResult"
+            },
+            "type": "object",
+            "title": "Results"
+          },
+          "explanation": {
+            "$ref": "#/components/schemas/Explanation"
+          }
+        },
+        "type": "object",
+        "required": [
+          "decision_id",
+          "decision_spec",
+          "scenarios",
+          "results",
+          "explanation"
+        ],
+        "title": "ComparisonResponse"
+      },
+      "CreateDecisionRequest": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "title": "Text",
+            "description": "Plain-English financial decision prompt"
+          },
+          "dataset_id": {
+            "type": "string",
+            "title": "Dataset Id",
+            "description": "Dataset id (from /datasets or /datasets/commit)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "text",
+          "dataset_id"
+        ],
+        "title": "CreateDecisionRequest"
+      },
+      "Explanation": {
+        "properties": {
+          "summary": {
+            "type": "string",
+            "title": "Summary"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source",
+            "description": "llm | template | none"
+          },
+          "guard_passed": {
+            "type": "boolean",
+            "title": "Guard Passed",
+            "description": "True if every number passed the Numeric Guard"
+          },
+          "violations": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Violations"
+          }
+        },
+        "type": "object",
+        "required": [
+          "summary",
+          "source",
+          "guard_passed"
+        ],
+        "title": "Explanation"
+      },
+      "FinancialMetrics": {
+        "properties": {
+          "cash_out_risk_pct": {
+            "type": "number",
+            "title": "Cash Out Risk Pct",
+            "description": "% of Monte Carlo runs that go below \u20b90"
+          },
+          "floor_breach_risk_pct": {
+            "type": "number",
+            "title": "Floor Breach Risk Pct",
+            "description": "% of runs that breach the emergency floor"
+          },
+          "survival_score_pct": {
+            "type": "number",
+            "title": "Survival Score Pct",
+            "description": "Composite solvency / floor-preservation score"
+          },
+          "p10_worst_balance": {
+            "type": "number",
+            "title": "P10 Worst Balance",
+            "description": "10th-percentile lowest balance across runs (\u20b9)"
+          },
+          "lowest_balance": {
+            "type": "number",
+            "title": "Lowest Balance",
+            "description": "Deterministic lowest closing balance (\u20b9)"
+          },
+          "lowest_balance_month": {
+            "type": "string",
+            "title": "Lowest Balance Month"
+          },
+          "months_below_floor": {
+            "type": "integer",
+            "title": "Months Below Floor"
+          },
+          "runway_months": {
+            "type": "number",
+            "title": "Runway Months"
+          },
+          "ending_balance": {
+            "type": "number",
+            "title": "Ending Balance"
+          },
+          "emergency_floor": {
+            "type": "number",
+            "title": "Emergency Floor"
+          },
+          "total_purchase_cost": {
+            "type": "number",
+            "title": "Total Purchase Cost"
+          },
+          "total_financing_interest": {
+            "type": "number",
+            "title": "Total Financing Interest"
+          },
+          "total_trims_saved": {
+            "type": "number",
+            "title": "Total Trims Saved"
+          }
+        },
+        "type": "object",
+        "required": [
+          "cash_out_risk_pct",
+          "floor_breach_risk_pct",
+          "survival_score_pct",
+          "p10_worst_balance",
+          "lowest_balance",
+          "lowest_balance_month",
+          "months_below_floor",
+          "runway_months",
+          "ending_balance",
+          "emergency_floor",
+          "total_purchase_cost",
+          "total_financing_interest",
+          "total_trims_saved"
+        ],
+        "title": "FinancialMetrics"
+      },
+      "FinancialScenarioResult": {
+        "properties": {
+          "scenario_id": {
+            "type": "string",
+            "title": "Scenario Id"
+          },
+          "decision_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decision Id"
+          },
+          "branch_type": {
+            "type": "string",
+            "enum": [
+              "baseline",
+              "upfront",
+              "emi",
+              "phased",
+              "trim"
+            ],
+            "title": "Branch Type"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "is_feasible": {
+            "type": "boolean",
+            "title": "Is Feasible"
+          },
+          "purchase_month": {
+            "type": "integer",
+            "title": "Purchase Month",
+            "description": "Month index of the (first) purchase; -1 for baseline"
+          },
+          "solver": {
+            "$ref": "#/components/schemas/SolverInfo"
+          },
+          "metrics": {
+            "$ref": "#/components/schemas/FinancialMetrics"
+          },
+          "simulation": {
+            "$ref": "#/components/schemas/FinancialSimulation"
+          },
+          "cash_flow": {
+            "$ref": "#/components/schemas/CashFlowMatrix"
+          },
+          "category_trims": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "Category Trims",
+            "description": "category -> cut fraction"
+          },
+          "explanation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Explanation"
+          }
+        },
+        "type": "object",
+        "required": [
+          "scenario_id",
+          "branch_type",
+          "is_feasible",
+          "purchase_month",
+          "solver",
+          "metrics",
+          "simulation",
+          "cash_flow"
+        ],
+        "title": "FinancialScenarioResult"
+      },
+      "FinancialSimulation": {
+        "properties": {
+          "n_runs": {
+            "type": "integer",
+            "title": "N Runs"
+          },
+          "prob_cash_out": {
+            "type": "number",
+            "title": "Prob Cash Out",
+            "description": "0\u20131"
+          },
+          "monthly_balances": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array",
+            "title": "Monthly Balances",
+            "description": "Deterministic closing balance per month"
+          },
+          "balance_p10": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array",
+            "title": "Balance P10",
+            "description": "Monte Carlo P10 balance per month"
+          },
+          "balance_p90": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array",
+            "title": "Balance P90",
+            "description": "Monte Carlo P90 balance per month"
+          },
+          "per_metric": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/MetricDistribution"
+            },
+            "type": "object",
+            "title": "Per Metric"
+          }
+        },
+        "type": "object",
+        "required": [
+          "n_runs",
+          "prob_cash_out",
+          "monthly_balances",
+          "balance_p10",
+          "balance_p90",
+          "per_metric"
+        ],
+        "title": "FinancialSimulation"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "MetricDistribution": {
+        "properties": {
+          "mean": {
+            "type": "number",
+            "title": "Mean"
+          },
+          "std": {
+            "type": "number",
+            "title": "Std"
+          },
+          "p10": {
+            "type": "number",
+            "title": "P10"
+          },
+          "p90": {
+            "type": "number",
+            "title": "P90"
+          }
+        },
+        "type": "object",
+        "required": [
+          "mean",
+          "std",
+          "p10",
+          "p90"
+        ],
+        "title": "MetricDistribution"
+      },
+      "RunStatus": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "decision_id": {
+            "type": "string",
+            "title": "Decision Id"
+          },
+          "overall_status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "running",
+              "done",
+              "failed"
+            ],
+            "title": "Overall Status"
+          },
+          "scenarios": {
+            "additionalProperties": {
+              "type": "string",
+              "enum": [
+                "queued",
+                "running",
+                "done",
+                "failed"
+              ]
+            },
+            "type": "object",
+            "title": "Scenarios"
+          },
+          "progress_percent": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Progress Percent"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "decision_id",
+          "overall_status",
+          "scenarios"
+        ],
+        "title": "RunStatus"
+      },
+      "Scenario": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "decision_id": {
+            "type": "string",
+            "title": "Decision Id"
+          },
+          "parent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description"
+          },
+          "change": {
+            "$ref": "#/components/schemas/ChangeSpec"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "running",
+              "done",
+              "failed"
+            ],
+            "title": "Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "decision_id",
+          "name",
+          "description",
+          "change",
+          "status"
+        ],
+        "title": "Scenario"
+      },
+      "SolverInfo": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status",
+            "description": "OPTIMAL | FEASIBLE | INFEASIBLE | UNKNOWN"
+          },
+          "solver": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Solver"
+          },
+          "runtime_s": {
+            "type": "number",
+            "title": "Runtime S"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "runtime_s"
+        ],
+        "title": "SolverInfo"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
       }
     }
   }

@@ -1,6 +1,6 @@
 """
 FutureFork FastAPI Main Application
-Team FutureLabs | Elite Coders CodeSprint 2026 | Person B
+Team FutureLabs | Elite Coders CodeSprint 2026
 """
 
 import logging
@@ -19,6 +19,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from backend import settings
 from backend.api.routes import router
 from backend.db.repository import init_db
 
@@ -31,42 +32,41 @@ logger = logging.getLogger("futurefork")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: initialize DB tables and seed sample dataset
+    # Startup: create tables and seed the bundled sample datasets
     logger.info("Initializing FutureFork Database...")
     init_db()
-    logger.info("Database initialized with sample dataset.")
+    logger.info("Database initialized with sample datasets.")
     yield
     # Shutdown
     logger.info("FutureFork Backend shutting down.")
 
 app = FastAPI(
     title="FutureFork API",
-    description="Optimization and Monte Carlo Scenario Branching Engine for Resource Allocation.",
+    description="Financial decision forking: CP-SAT cash-flow optimization and Monte Carlo stress tests.",
     version="0.1.0",
     lifespan=lifespan,
 )
 
-# CORS Configuration
-allowed_origins = os.getenv(
-    "CORS_ORIGINS",
-    "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,https://futurefork.vercel.app",
-).split(",")
-
+# CORS: explicit origins from CORS_ORIGINS. A wildcard is only honoured without credentials,
+# since browsers reject credentialed requests to "*".
+_wildcard = "*" in settings.CORS_ORIGINS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Allow all origins for hackathon / Vercel previews
-    allow_credentials=True,
+    allow_origins=["*"] if _wildcard else settings.CORS_ORIGINS,
+    allow_credentials=not _wildcard,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Standardized Error Handling Middleware: {error: code, message: text}
+
+# Standardized error shape: {error: code, message: text}. Details stay in the server log.
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.exception(f"Unhandled exception on {request.url.path}: {exc}")
+    message = "An unexpected error occurred." if settings.IS_PRODUCTION else f"{type(exc).__name__}: {exc}"
     return JSONResponse(
         status_code=500,
-        content={"error": "INTERNAL_SERVER_ERROR", "message": str(exc)},
+        content={"error": "INTERNAL_SERVER_ERROR", "message": message},
     )
 
 # Include API routes

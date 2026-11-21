@@ -69,3 +69,6 @@ pnpm-debug.log*
 
 # Temporary scratch files
 scratch/
+
+# Local database backups
+*.bak

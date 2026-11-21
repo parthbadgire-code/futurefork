@@ -1,74 +1,144 @@
 """
-FutureFork REST API Routes  —  Member 5
-Implements the full financial CSV pipeline:
+FutureFork REST API Routes
+Financial CSV decision pipeline:
 
-  POST /datasets/inspect  → upload CSV, get ColumnMapping + 5-row preview
-  POST /datasets/commit   → confirm mapping, run ingestor + baseline, save Node 0
-  POST /decisions         → parse plain-English prompt into 4 policy forks
-  POST /decisions/{id}/scenarios  → generate 4 branch scenarios
-  POST /decisions/{id}/run        → kick off CP-SAT + Monte Carlo pipeline
+  POST /datasets/inspect          → upload CSV, get proposed ColumnMapping + 5-row preview
+  POST /datasets/commit           → confirm mapping, compile Node 0 baseline, save dataset
+  GET  /datasets                  → list datasets (bundled samples + committed uploads)
+  GET  /datasets/{id}             → a dataset's summary and Node 0 metrics
+  POST /decisions                 → parse a plain-English decision
+  POST /decisions/{id}/scenarios  → generate baseline + 4 policy forks
+  POST /decisions/{id}/run        → evaluate all forks (CP-SAT + Monte Carlo) in the background
   GET  /runs/{run_id}             → poll run status
-  GET  /scenarios/{id}/result     → fetch a single branch result
-  GET  /decisions/{id}/compare    → side-by-side comparison + AI explanation
-  POST /scenarios/{id}/branch     → Phase-2 user-defined child branch
-  GET  /datasets                  → list committed datasets
-  GET  /datasets/{id}             → fetch a dataset's Node-0 baseline
+  GET  /scenarios/{id}/result     → one evaluated fork
+  GET  /decisions/{id}/compare    → side-by-side results + guarded AI explanation
+  POST /scenarios/{id}/branch     → user-defined child fork, evaluated immediately
   GET  /health  /ping             → liveness
 """
 
+import csv
 import io
 import logging
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from backend.db.repository import Repository
+from backend import settings
+from backend.db.repository import Repository, build_dataset_record
 from backend.db.session import get_db
 from backend.orchestration.integrations import (
+    call_evaluate_scenario,
     call_explain,
     call_generate_scenarios,
     call_parse_decision,
+    dataset_type_of,
+    load_instance,
+    to_api_result,
 )
 from backend.orchestration.runner import dispatch_decision_run
+from contracts.schemas import ComparisonResponse, FinancialScenarioResult, RunStatus, Scenario
 
 logger = logging.getLogger("futurefork.api")
 
 router = APIRouter()
 
+UPLOAD_TTL_MINUTES = 15
+DATASET_TYPES = ("personal", "institute", "startup")
+
 
 # ---------------------------------------------------------------------------
-# Request / Response schemas (Member 5 additions)
+# Request schemas
 # ---------------------------------------------------------------------------
 
 class CommitRequest(BaseModel):
     upload_id: str = Field(..., description="upload_id returned by /datasets/inspect")
     confirmed_mapping: Dict[str, Any] = Field(
-        ..., description="Confirmed ColumnMapping dict (from inspect response or user-edited)"
+        ..., description="Confirmed ColumnMapping (from the inspect response, optionally edited)"
     )
     dataset_name: Optional[str] = Field(None, description="Human-friendly name for the dataset")
     starting_balance: Optional[float] = Field(
-        None, description="Override starting cash balance (₹)"
+        None, description="Opening cash balance (₹). Overrides any balance inferred from the CSV."
     )
+    dataset_type: Optional[str] = Field(
+        None, description="personal | institute | startup (defaults to the type detected at inspect)"
+    )
+
 
 class CreateDecisionRequest(BaseModel):
     text: str = Field(..., description="Plain-English financial decision prompt")
-    dataset_id: str = Field(..., description="Committed dataset_id (from /datasets/commit)")
+    dataset_id: str = Field(..., description="Dataset id (from /datasets or /datasets/commit)")
+
 
 class BranchScenarioRequest(BaseModel):
     name: str = Field(..., description="Name for the new child scenario")
-    change: Dict[str, Any] = Field(..., description="ChangeSpec payload")
+    change: Dict[str, Any] = Field(
+        ...,
+        description="ChangeSpec: {type: upfront|emi|phased|trim, params: {...overrides}}",
+    )
 
 
 # ---------------------------------------------------------------------------
-# 1. Health & Liveness
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _not_found(code: str, message: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": code, "message": message})
+
+
+def _decode_csv(raw_bytes: bytes) -> str:
+    for enc in ("utf-8-sig", "utf-8", "cp1252"):
+        try:
+            return raw_bytes.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw_bytes.decode("latin-1", errors="replace")
+
+
+def _read_csv_head(text: str, n: int = 5) -> Tuple[List[str], List[Dict[str, Any]]]:
+    reader = csv.DictReader(io.StringIO(text))
+    headers = list(reader.fieldnames or [])
+    rows: List[Dict[str, Any]] = []
+    for i, row in enumerate(reader):
+        if i >= n:
+            break
+        rows.append(dict(row))
+    return headers, rows
+
+
+def _dataset_type_hint(filename: str) -> Optional[str]:
+    name = filename.lower()
+    if any(k in name for k in ["erp", "institute", "college"]):
+        return "institute"
+    if any(k in name for k in ["pnl", "startup", "burn"]):
+        return "startup"
+    return None
+
+
+def _get_dataset_or_404(repo: Repository, dataset_id: str) -> Dict[str, Any]:
+    ds = repo.get_dataset(dataset_id)
+    if not ds:
+        raise _not_found("DATASET_NOT_FOUND", f"Dataset {dataset_id} not found")
+    return ds
+
+
+def _get_decision_or_404(repo: Repository, decision_id: str) -> Dict[str, Any]:
+    decision = repo.get_decision(decision_id)
+    if not decision:
+        raise _not_found("DECISION_NOT_FOUND", f"Decision {decision_id} not found")
+    return decision
+
+
+# ---------------------------------------------------------------------------
+# 1. Health & liveness
 # ---------------------------------------------------------------------------
 
 @router.get("/health")
 def health_check():
     return {"status": "ok", "service": "futurefork-backend", "engine": "cp-sat+numpy"}
+
 
 @router.get("/ping")
 def keep_warm_ping():
@@ -81,31 +151,24 @@ def keep_warm_ping():
 
 @router.get("/datasets")
 def list_datasets(db: Session = Depends(get_db)):
-    repo = Repository(db)
-    return repo.list_datasets()
+    return Repository(db).list_datasets()
+
 
 @router.get("/datasets/{dataset_id}")
 def get_dataset(dataset_id: str, db: Session = Depends(get_db)):
-    repo = Repository(db)
-    ds = repo.get_dataset(dataset_id)
-    if not ds:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": "DATASET_NOT_FOUND", "message": f"Dataset {dataset_id} not found"},
-        )
+    ds = _get_dataset_or_404(Repository(db), dataset_id)
     return {
         "id": ds["id"],
         "name": ds["name"],
         "description": ds["description"],
+        "dataset_type": dataset_type_of(ds.get("payload") or {}),
         "stats": ds["stats"],
         "baseline_metrics": ds["baseline_metrics"],
     }
 
 
 # ---------------------------------------------------------------------------
-# 3. POST /datasets/inspect
-#    Accepts uploaded CSV, caches raw bytes (15-min TTL upload_id),
-#    returns Member 4's proposed ColumnMapping + 5-row preview.
+# 3. POST /datasets/inspect — step 1 of CSV onboarding
 # ---------------------------------------------------------------------------
 
 @router.post("/datasets/inspect", status_code=status.HTTP_200_OK)
@@ -114,11 +177,9 @@ async def inspect_dataset(
     db: Session = Depends(get_db),
 ):
     """
-    Step 1 of 2 in the CSV onboarding pipeline.
     Reads the uploaded CSV, proposes a ColumnMapping, and returns a 5-row preview.
-    Raw bytes are cached for 15 minutes under a fresh upload_id.
+    Raw bytes are held for 15 minutes under a fresh upload_id.
     """
-    # Read raw bytes
     raw_bytes: bytes = await file.read()
     if not raw_bytes:
         raise HTTPException(
@@ -127,490 +188,242 @@ async def inspect_dataset(
         )
 
     filename = file.filename or "upload.csv"
-
-    # Delegate to Member 4's mapper agent (with deterministic regex fallback)
-    proposed_mapping: Dict[str, Any] = {}
-    preview_rows: List[Dict[str, Any]] = []
-
-    try:
-        import csv as _csv
-        import io as _io
-        # Decode raw bytes to get headers + sample rows for Member 4's propose_mapping API
-        _text = None
-        for _enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
-            try:
-                _text = raw_bytes.decode(_enc)
-                break
-            except UnicodeDecodeError:
-                continue
-        _text = _text or raw_bytes.decode("latin-1", errors="replace")
-        _reader = _csv.DictReader(_io.StringIO(_text))
-        _headers = list(_reader.fieldnames or [])
-        _sample_rows = []
-        for _i, _row in enumerate(_reader):
-            if _i >= 3:
-                break
-            _sample_rows.append(dict(_row))
-
-        from ai.agents.mapper import propose_mapping  # Member 4
-        # Sniff dataset type from filename for a better mapping hint
-        _fname_lower = filename.lower()
-        _dtype_hint = (
-            "institute" if any(k in _fname_lower for k in ["erp", "institute", "college"])
-            else "startup" if any(k in _fname_lower for k in ["pnl", "startup", "burn"])
-            else "personal"
+    text = _decode_csv(raw_bytes)
+    headers, preview_rows = _read_csv_head(text, n=5)
+    if not headers:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "NO_HEADERS", "message": "Could not find a header row in the CSV."},
         )
-        _result = propose_mapping(_headers, _sample_rows, dataset_type_hint=_dtype_hint)
-        # MappingResult has .mapping (ColumnMapping dataclass) and .confidence
-        _col_map = _result.mapping if hasattr(_result, "mapping") else _result
-        if hasattr(_col_map, "to_dict"):
-            proposed_mapping = _col_map.to_dict()
-        elif hasattr(_col_map, "__dict__"):
-            proposed_mapping = {k: v for k, v in _col_map.__dict__.items() if not k.startswith("_")}
-        else:
-            proposed_mapping = dict(_col_map) if _col_map else {}
-        # Build 5-row preview from already-read sample rows
-        _reader2 = _csv.DictReader(_io.StringIO(_text))
-        preview_rows = []
-        for _i, _row in enumerate(_reader2):
-            if _i >= 5:
-                break
-            preview_rows.append(dict(_row))
-    except (ImportError, AttributeError, Exception) as exc:
-        logger.warning(f"mapper agent unavailable ({exc}), using regex fallback")
-        proposed_mapping, preview_rows = _regex_mapping_fallback(raw_bytes, filename)
 
-    # Generate a fresh upload_id and persist with 15-min TTL
+    from ai.agents.mapper import propose_mapping
+
+    result = propose_mapping(headers, preview_rows[:3], dataset_type_hint=_dataset_type_hint(filename))
+    proposed_mapping = result.mapping.to_dict()
+    dataset_type = result.dataset_type if result.dataset_type in DATASET_TYPES else "personal"
+
     upload_id = f"upl_{uuid.uuid4().hex[:16]}"
-    repo = Repository(db)
-    repo.save_upload(
+    Repository(db).save_upload(
         upload_id=upload_id,
         csv_bytes=raw_bytes,
         filename=filename,
         preview_rows=preview_rows,
-        column_mapping=proposed_mapping,
-        ttl_minutes=15,
+        column_mapping={**proposed_mapping, "_dataset_type": dataset_type},
+        ttl_minutes=UPLOAD_TTL_MINUTES,
     )
 
     return {
         "upload_id": upload_id,
         "filename": filename,
+        "headers": headers,
         "proposed_mapping": proposed_mapping,
+        "mapping_confidence": result.confidence,
+        "mapping_source": result.tier_used,
+        "dataset_type": dataset_type,
         "preview_rows": preview_rows,
-        "ttl_seconds": 900,
-        "message": (
-            "Review the proposed column mapping. If correct, POST to /datasets/commit "
-            "with this upload_id and confirmed_mapping."
-        ),
+        "ttl_seconds": UPLOAD_TTL_MINUTES * 60,
     }
-
-
-def _regex_mapping_fallback(
-    raw_bytes: bytes, filename: str
-) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """
-    Pure-regex deterministic ColumnMapping fallback — works offline / rate-limited.
-    Reads up to 6 rows (1 header + 5 data) and sniffs column semantics.
-    """
-    import csv
-    import io
-    import re
-
-    # Try multiple encodings
-    text = None
-    for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
-        try:
-            text = raw_bytes.decode(enc)
-            break
-        except UnicodeDecodeError:
-            continue
-    if text is None:
-        text = raw_bytes.decode("latin-1", errors="replace")
-
-    reader = csv.DictReader(io.StringIO(text))
-    headers = reader.fieldnames or []
-
-    # Sniff columns by name
-    DATE_RE  = re.compile(r"date|dt|time|txn_date|value_date", re.I)
-    AMT_RE   = re.compile(r"^amount$|^amt$|^net$", re.I)
-    DEBIT_RE = re.compile(r"debit|withdrawal|dr|expense|outflow|credit_debit.*d", re.I)
-    CRED_RE  = re.compile(r"credit|deposit|cr|inflow|credit_debit.*c", re.I)
-    CAT_RE   = re.compile(r"category|cat|head|account_head|type|classification", re.I)
-    DESC_RE  = re.compile(r"description|narration|particular|remark|detail|note", re.I)
-    TYPE_RE  = re.compile(r"^type$|txn.?type|transaction.?type", re.I)
-
-    def _first(pat):
-        for h in headers:
-            if pat.search(h):
-                return h
-        return None
-
-    mapping: Dict[str, Any] = {
-        "date_col":        _first(DATE_RE)  or (headers[0] if headers else "Date"),
-        "amount_col":      _first(AMT_RE),
-        "debit_col":       _first(DEBIT_RE),
-        "credit_col":      _first(CRED_RE),
-        "category_col":    _first(CAT_RE),
-        "description_col": _first(DESC_RE),
-        "type_col":        _first(TYPE_RE),
-        "date_format":     None,
-        "starting_balance": 0.0,
-    }
-
-    # 5-row preview
-    preview: List[Dict[str, Any]] = []
-    try:
-        reader2 = csv.DictReader(io.StringIO(text))
-        for i, row in enumerate(reader2):
-            if i >= 5:
-                break
-            preview.append(dict(row))
-    except Exception:
-        pass
-
-    return mapping, preview
 
 
 # ---------------------------------------------------------------------------
-# 4. POST /datasets/commit
-#    Takes upload_id + confirmed mapping, runs Member 1's ingestor +
-#    Member 2's baseline evaluator, saves Node 0, returns baseline risks.
+# 4. POST /datasets/commit — step 2 of CSV onboarding (Node 0)
 # ---------------------------------------------------------------------------
 
 @router.post("/datasets/commit", status_code=status.HTTP_201_CREATED)
 def commit_dataset(req: CommitRequest, db: Session = Depends(get_db)):
-    """
-    Step 2 of 2 in the CSV onboarding pipeline.
-    Compiles the uploaded CSV → FinancialProblemInstance (Node 0) using
-    Member 1's ingestor, evaluates the baseline with Member 2's solver,
-    persists to DB, and returns the baseline clash/risk summary.
-    """
+    """Compiles the uploaded CSV into a 12-month baseline (Node 0) and saves it as a dataset."""
     repo = Repository(db)
-
-    # Retrieve the cached upload
     upload = repo.get_upload(req.upload_id)
     if not upload:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "error": "UPLOAD_NOT_FOUND",
-                "message": (
-                    f"Upload {req.upload_id} not found or has expired (15-min TTL). "
-                    "Please re-upload via POST /datasets/inspect."
-                ),
-            },
+        raise _not_found(
+            "UPLOAD_NOT_FOUND",
+            f"Upload {req.upload_id} not found or has expired (15-min TTL). "
+            "Please re-upload via POST /datasets/inspect.",
         )
 
-    csv_bytes: bytes = upload["csv_bytes"]
     filename: str = upload["filename"]
-
-    # Override starting_balance if user supplied it
-    confirmed_mapping = dict(req.confirmed_mapping)
+    mapping = {k: v for k, v in req.confirmed_mapping.items() if not k.startswith("_")}
     if req.starting_balance is not None:
-        confirmed_mapping["starting_balance"] = req.starting_balance
+        mapping["starting_balance"] = req.starting_balance
 
-    # --- Member 1: FinancialIngestor.compile ---
-    instance = None
+    detected_type = (upload.get("column_mapping") or {}).get("_dataset_type", "personal")
+    dataset_type = req.dataset_type if req.dataset_type in DATASET_TYPES else detected_type
+    dataset_id = f"ds_{uuid.uuid4().hex[:12]}"
+    ds_name = req.dataset_name or filename.rsplit(".", 1)[0].replace("_", " ").title()
+
+    from data.ingestor import ColumnMapping, FinancialIngestor
+
     try:
-        from data.ingestor import ColumnMapping as IngestorMapping  # Member 1
-        from data.ingestor import FinancialIngestor
-        col_map = IngestorMapping.from_dict(confirmed_mapping)
-        dataset_id = f"ds_{uuid.uuid4().hex[:12]}"
-        ds_name = req.dataset_name or filename.replace(".csv", "").replace("_", " ").title()
         instance = FinancialIngestor.compile(
-            csv_source=io.BytesIO(csv_bytes),
-            mapping=col_map,
+            csv_source=io.BytesIO(upload["csv_bytes"]),
+            mapping=ColumnMapping.from_dict(mapping),
             dataset_id=dataset_id,
             name=ds_name,
+            starting_balance=req.starting_balance,
         )
-    except (ImportError, AttributeError) as exc:
-        logger.warning(f"FinancialIngestor unavailable ({exc}), using stub instance")
-        instance = None
     except Exception as exc:
+        logger.warning(f"CSV compilation failed for {filename}: {exc}")
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail={
                 "error": "INGEST_FAILED",
-                "message": f"CSV compilation failed: {exc}",
+                "message": "Could not compile the CSV with this column mapping. "
+                "Check the date, amount/debit/credit and category columns.",
             },
         )
 
-    # --- Member 2: evaluate_financial_baseline (Node 0) ---
-    baseline_result = None
-    baseline_metrics: Dict[str, Any] = {}
-
-    if instance is not None:
-        try:
-            from engine.solver import evaluate_financial_baseline  # Member 2
-            baseline_result = evaluate_financial_baseline(
-                instance=instance,
-                emergency_floor=float(confirmed_mapping.get("starting_balance", 0.0)) * 0.0,
-            )
-            baseline_metrics = baseline_result.metrics if baseline_result else {}
-        except (ImportError, AttributeError) as exc:
-            logger.warning(f"evaluate_financial_baseline unavailable: {exc}")
-        except Exception as exc:
-            logger.warning(f"Baseline evaluation error (non-fatal): {exc}")
-
-    # Build the dataset payload to persist
-    if instance is not None:
-        try:
-            instance_dict = instance.to_dict()
-        except Exception:
-            instance_dict = {}
-        stats = {
-            "months": len(instance.months),
-            "categories": len(instance.categories),
-            "total_transactions": int(sum(instance.total_outflows)) if instance.total_outflows else 0,
-            "starting_balance": instance.starting_balance,
-            "category_types": instance.category_types,
-        }
-    else:
-        # Fallback stub if ingestor is not yet available
-        dataset_id = f"ds_{uuid.uuid4().hex[:12]}"
-        ds_name = req.dataset_name or filename.replace(".csv", "").replace("_", " ").title()
-        instance_dict = {}
-        stats = {"months": 12, "categories": 8, "source": filename}
-        baseline_metrics = {}
-
-    # Serialize baseline result if present
-    if baseline_result is not None:
-        try:
-            br_dict = baseline_result.to_dict() if hasattr(baseline_result, "to_dict") else {}
-        except Exception:
-            br_dict = {}
-    else:
-        br_dict = {}
-
-    payload = {
-        "summary": {
-            "id": dataset_id,
-            "name": ds_name,
-            "description": f"Financial dataset compiled from {filename}",
-            "stats": stats,
-            "baseline_metrics": baseline_metrics,
-        },
-        "instance": instance_dict,
-        "baseline_result": br_dict,
-        "column_mapping": confirmed_mapping,
-        "source_filename": filename,
-    }
-
-    ds_record: Dict[str, Any] = {
-        "id": dataset_id,
-        "name": ds_name,
-        "description": f"Financial dataset compiled from {filename}",
-        "stats": stats,
-        "baseline_metrics": baseline_metrics,
-        "payload": payload,
-    }
-    repo.save_dataset(ds_record)
-
-    # Clean up the temporary upload
+    record = build_dataset_record(instance, dataset_id, ds_name, dataset_type, filename, mapping)
+    repo.save_dataset(record)
     repo.delete_upload(req.upload_id)
-
-    # Surface clashes / risks from baseline metrics
-    baseline_risks = _extract_baseline_risks(baseline_metrics)
 
     return {
         "dataset_id": dataset_id,
         "name": ds_name,
-        "stats": stats,
-        "baseline_metrics": baseline_metrics,
-        "baseline_risks": baseline_risks,
-        "message": (
-            f"Node 0 (Baseline) committed successfully. "
-            f"Now POST /decisions with dataset_id='{dataset_id}' and your financial decision prompt."
-        ),
+        "dataset_type": dataset_type,
+        "stats": record["stats"],
+        "baseline_metrics": record["baseline_metrics"],
+        "baseline_risks": _extract_baseline_risks(record["baseline_metrics"]),
     }
 
 
 def _extract_baseline_risks(metrics: Dict[str, Any]) -> Dict[str, Any]:
-    """Summarise the Node-0 risk signals in a human-readable dict."""
+    """Summarises the Node 0 risk signals."""
     risks: Dict[str, Any] = {}
     if not metrics:
         return risks
-
     if metrics.get("months_below_floor", 0) > 0:
         risks["floor_breach_months"] = metrics["months_below_floor"]
         risks["floor_breach_severity"] = "HIGH" if metrics["months_below_floor"] >= 3 else "MEDIUM"
-
     if metrics.get("cash_out_risk_pct", 0) > 0:
         risks["cash_out_risk_pct"] = metrics["cash_out_risk_pct"]
-
     if metrics.get("runway_months") is not None:
         risks["runway_months"] = metrics["runway_months"]
-
     if metrics.get("survival_score_pct") is not None:
         score = metrics["survival_score_pct"]
         risks["survival_score_pct"] = score
         risks["health"] = "GOOD" if score >= 80 else ("FAIR" if score >= 50 else "POOR")
-
     return risks
 
 
 # ---------------------------------------------------------------------------
-# 5. POST /decisions  — parse financial decision into 4 policy forks
+# 5. POST /decisions — parse a plain-English decision
 # ---------------------------------------------------------------------------
 
 @router.post("/decisions", status_code=status.HTTP_201_CREATED)
 def create_decision(req: CreateDecisionRequest, db: Session = Depends(get_db)):
     repo = Repository(db)
-    ds = repo.get_dataset(req.dataset_id)
-    if not ds:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": "DATASET_NOT_FOUND", "message": f"Dataset {req.dataset_id} not found"},
-        )
-
-    summary = {
-        "id": ds["id"],
-        "name": ds["name"],
-        "stats": ds["stats"],
-        "baseline_metrics": ds["baseline_metrics"],
-    }
-
-    # Member 4: parse plain-English → DecisionSpec
-    spec = call_parse_decision(req.text, summary)
-    spec["dataset_id"] = req.dataset_id
-
-    # Normalise: Member 4's new parser returns "financial" key; map it to "change"
-    # so the rest of the pipeline (solver, scenarios, compare) always sees "change"
-    if "change" not in spec and "financial" in spec:
-        fin = spec["financial"]
-        spec["change"] = {
-            "type": fin.get("financing_preference", "big_purchase"),
-            "params": {
-                "total_cost": fin.get("total_cost", 0.0),
-                "emergency_floor": fin.get("emergency_floor", 0.0),
-                "item_label": fin.get("item_label", ""),
-            },
-        }
-
+    ds = _get_dataset_or_404(repo, req.dataset_id)
+    payload = ds.get("payload") or {}
+    spec = call_parse_decision(
+        req.text,
+        dataset_id=req.dataset_id,
+        instance=load_instance(payload),
+        dataset_type=dataset_type_of(payload),
+    )
     repo.save_decision(spec)
     return spec
 
 
 # ---------------------------------------------------------------------------
-# 6. POST /decisions/{id}/scenarios  — generate 4 competing policy forks
+# 6. POST /decisions/{id}/scenarios — baseline + 4 policy forks
 # ---------------------------------------------------------------------------
 
-@router.post("/decisions/{decision_id}/scenarios")
-def generate_scenarios_endpoint(decision_id: str, db: Session = Depends(get_db)):
-    repo = Repository(db)
-    decision = repo.get_decision(decision_id)
-    if not decision:
+def _generate_and_save_scenarios(repo: Repository, decision: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if decision.get("status") != "ok":
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": "DECISION_NOT_FOUND", "message": f"Decision {decision_id} not found"},
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "DECISION_NOT_READY",
+                "message": decision.get("message") or "Decision needs clarification before forking.",
+            },
         )
-
-    scenarios = call_generate_scenarios(decision)
+    ds = _get_dataset_or_404(repo, decision["dataset_id"])
+    scenarios = call_generate_scenarios(decision, load_instance(ds.get("payload") or {}))
     repo.save_scenarios(scenarios)
     return scenarios
 
 
+@router.post("/decisions/{decision_id}/scenarios", response_model=list[Scenario])
+def generate_scenarios_endpoint(decision_id: str, db: Session = Depends(get_db)):
+    repo = Repository(db)
+    return _generate_and_save_scenarios(repo, _get_decision_or_404(repo, decision_id))
+
+
 # ---------------------------------------------------------------------------
-# 7. POST /decisions/{id}/run  — kick off CP-SAT + Monte Carlo pipeline
+# 7. POST /decisions/{id}/run — CP-SAT + Monte Carlo in the background
 # ---------------------------------------------------------------------------
 
 @router.post("/decisions/{decision_id}/run")
 def start_run(decision_id: str, db: Session = Depends(get_db)):
     repo = Repository(db)
-    decision = repo.get_decision(decision_id)
-    if not decision:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": "DECISION_NOT_FOUND", "message": f"Decision {decision_id} not found"},
-        )
+    decision = _get_decision_or_404(repo, decision_id)
 
-    scenarios = repo.get_scenarios(decision_id)
-    if not scenarios:
-        scenarios = call_generate_scenarios(decision)
-        repo.save_scenarios(scenarios)
+    scenarios = repo.get_scenarios(decision_id) or _generate_and_save_scenarios(repo, decision)
 
     run_id = f"run_{uuid.uuid4().hex[:12]}"
     repo.create_run(run_id, decision_id, [s["id"] for s in scenarios])
-
-    # Dispatch background worker (Members 2 + 3 pipeline)
     dispatch_decision_run(decision_id, run_id)
-
     return {"run_id": run_id}
 
 
 # ---------------------------------------------------------------------------
-# 8. GET /runs/{run_id}  — poll pipeline status
+# 8. GET /runs/{run_id}
 # ---------------------------------------------------------------------------
 
-@router.get("/runs/{run_id}")
+@router.get("/runs/{run_id}", response_model=RunStatus)
 def get_run_status(run_id: str, db: Session = Depends(get_db)):
-    repo = Repository(db)
-    run_info = repo.get_run(run_id)
+    run_info = Repository(db).get_run(run_id)
     if not run_info:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": "RUN_NOT_FOUND", "message": f"Run {run_id} not found"},
-        )
+        raise _not_found("RUN_NOT_FOUND", f"Run {run_id} not found")
     return run_info
 
 
 # ---------------------------------------------------------------------------
-# 9. GET /scenarios/{id}/result  — single branch result
+# 9. GET /scenarios/{id}/result
 # ---------------------------------------------------------------------------
 
-@router.get("/scenarios/{scenario_id}/result")
+@router.get("/scenarios/{scenario_id}/result", response_model=FinancialScenarioResult)
 def get_scenario_result(scenario_id: str, db: Session = Depends(get_db)):
-    repo = Repository(db)
-    res = repo.get_result(scenario_id)
-    if not res:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "error": "RESULT_NOT_FOUND",
-                "message": f"Result for {scenario_id} not found or not yet ready",
-            },
-        )
-    return res
+    raw = Repository(db).get_result(scenario_id)
+    if not raw:
+        raise _not_found("RESULT_NOT_FOUND", f"Result for {scenario_id} not found or not yet ready")
+    return to_api_result(raw)
 
 
 # ---------------------------------------------------------------------------
-# 10. GET /decisions/{id}/compare  — 4-branch comparison + AI explanation
+# 10. GET /decisions/{id}/compare — side-by-side + guarded AI explanation
 # ---------------------------------------------------------------------------
 
-@router.get("/decisions/{decision_id}/compare")
+@router.get("/decisions/{decision_id}/compare", response_model=ComparisonResponse)
 def get_decision_comparison(decision_id: str, db: Session = Depends(get_db)):
     repo = Repository(db)
-    decision = repo.get_decision(decision_id)
-    if not decision:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": "DECISION_NOT_FOUND", "message": f"Decision {decision_id} not found"},
-        )
-
+    decision = _get_decision_or_404(repo, decision_id)
     scenarios = repo.get_scenarios(decision_id)
-    results: Dict[str, Any] = {}
-    for sc in scenarios:
-        res = repo.get_result(sc["id"])
-        if res:
-            results[sc["id"]] = res
 
-    # Member 4: AI synthesis with Regex Numeric Guard
-    explanation = call_explain(decision, results)
+    raw_results: Dict[str, Any] = {}
+    for sc in scenarios:
+        raw = repo.get_result(sc["id"])
+        if raw:
+            raw_results[sc["id"]] = raw
 
     return {
         "decision_id": decision_id,
         "decision_spec": decision,
         "scenarios": scenarios,
-        "results": results,
-        "explanation": explanation,
+        "results": {sid: to_api_result(raw) for sid, raw in raw_results.items()},
+        "explanation": call_explain(decision, raw_results),
     }
 
 
 # ---------------------------------------------------------------------------
-# 11. POST /scenarios/{id}/branch  — Phase-2 user-defined child branch
+# 11. POST /scenarios/{id}/branch — user-defined child fork
 # ---------------------------------------------------------------------------
 
-@router.post("/scenarios/{parent_scenario_id}/branch", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/scenarios/{parent_scenario_id}/branch",
+    status_code=status.HTTP_201_CREATED,
+    response_model=Scenario,
+)
 def branch_scenario_endpoint(
     parent_scenario_id: str,
     req: BranchScenarioRequest,
@@ -619,56 +432,50 @@ def branch_scenario_endpoint(
     repo = Repository(db)
     from backend.db.models import ScenarioModel
 
-    parent_row = (
-        repo.db.query(ScenarioModel)
-        .filter(ScenarioModel.id == parent_scenario_id)
-        .first()
-    )
-    if not parent_row:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "error": "PARENT_NOT_FOUND",
-                "message": f"Parent scenario {parent_scenario_id} not found",
-            },
-        )
+    parent = repo.db.query(ScenarioModel).filter(ScenarioModel.id == parent_scenario_id).first()
+    if not parent:
+        raise _not_found("PARENT_NOT_FOUND", f"Parent scenario {parent_scenario_id} not found")
 
-    child_id = f"branch_{uuid.uuid4().hex[:8]}"
-    child_scenario = {
-        "id": child_id,
-        "decision_id": parent_row.decision_id,
-        "parent_id": parent_scenario_id,
-        "name": req.name,
-        "description": (
-            f"Custom child branch extending '{parent_row.name}' "
-            f"with change type '{req.change.get('type')}'."
-        ),
-        "change": req.change,
-        "status": "queued",
-    }
-    repo.save_scenarios([child_scenario])
-
-    # Evaluate immediately using the parent's dataset
-    decision = repo.get_decision(parent_row.decision_id)
-    dataset_id = decision.get("dataset_id", "") if decision else ""
-    dataset_row = repo.get_dataset(dataset_id) if dataset_id else None
-    dataset_payload = dataset_row["payload"] if dataset_row and dataset_row.get("payload") else {}
+    from engine.changes import normalize_branch_type
 
     try:
-        from backend.orchestration.integrations import call_evaluate_scenario
-        child_res = call_evaluate_scenario(
-            dataset=dataset_payload,
-            baseline_timetable=dataset_payload.get("baseline_timetable", []),
-            scenario=child_scenario,
-            n_sims=300,
-            seed=42,
+        branch_type = normalize_branch_type(req.change.get("type", ""))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "UNSUPPORTED_CHANGE", "message": str(exc)},
         )
-        repo.save_result(child_res)
-        repo.update_scenario_status(child_id, "done")
-        child_scenario["status"] = "done"
-    except Exception as exc:
-        logger.warning(f"Child scenario evaluation failed (non-fatal): {exc}")
-        repo.update_scenario_status(child_id, "failed")
-        child_scenario["status"] = "failed"
 
-    return child_scenario
+    # Child inherits the decision's purchase goal, then the parent's params; the request overrides
+    decision = _get_decision_or_404(repo, parent.decision_id)
+    params = {
+        **((decision.get("change") or {}).get("params") or {}),
+        **((parent.change or {}).get("params") or {}),
+        **(req.change.get("params") or {}),
+    }
+    child = {
+        "id": f"branch_{uuid.uuid4().hex[:8]}",
+        "decision_id": parent.decision_id,
+        "parent_id": parent_scenario_id,
+        "name": req.name,
+        "description": f"Custom {branch_type} fork branched from '{parent.name}'.",
+        "change": {"type": branch_type, "params": params},
+        "status": "queued",
+    }
+    repo.save_scenarios([child])
+
+    ds =_get_dataset_or_404(repo, decision["dataset_id"])
+    try:
+        raw = call_evaluate_scenario(
+            load_instance(ds.get("payload") or {}),
+            child,
+            n_sims=settings.NUM_SIMULATION_RUNS,
+            seed=settings.RANDOM_SEED,
+        )
+        repo.save_result(raw)
+        child["status"] = "done"
+    except Exception as exc:
+        logger.warning(f"Child scenario evaluation failed: {exc}")
+        child["status"] = "failed"
+    repo.update_scenario_status(child["id"], child["status"])
+    return child

@@ -10,11 +10,11 @@ Thin, robust wrapper providing validated structured output:
 - Deterministic fallback when no external LLM key is configured
 """
 
+import logging
 import os
 import time
-import json
-import logging
-from typing import Type, TypeVar, Optional, Dict, Any
+from typing import Any, Dict, Optional, Type, TypeVar
+
 from pydantic import BaseModel, ValidationError
 
 logger = logging.getLogger("futurefork.ai.llm")

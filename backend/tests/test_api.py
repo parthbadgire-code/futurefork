@@ -1,6 +1,6 @@
 """
-FutureFork Backend Tests — Member 5
-Covers the full financial CSV pipeline:
+FutureFork Backend Tests
+Covers the full financial CSV pipeline against the real engine (no stubs):
   - Health / ping
   - POST /datasets/inspect  (CSV upload → ColumnMapping + preview)
   - POST /datasets/commit   (ingest + baseline Node 0)
@@ -184,17 +184,19 @@ def test_commit_expired_upload_raises_404(db_session):
 
 def test_list_datasets(committed_dataset_id, db_session):
     datasets = routes.list_datasets(db=db_session)
-    assert isinstance(datasets, list)
-    assert len(datasets) >= 1
     ids = [d["id"] for d in datasets]
     assert committed_dataset_id in ids
+    # Bundled sample CSVs are seeded at startup
+    for sample_id in ("sample_personal", "sample_institute", "sample_startup"):
+        assert sample_id in ids
 
 
 def test_get_dataset(committed_dataset_id, db_session):
     ds = routes.get_dataset(committed_dataset_id, db=db_session)
     assert ds["id"] == committed_dataset_id
-    assert "stats" in ds
-    assert "baseline_metrics" in ds
+    assert ds["stats"]["months"] == 12
+    assert "survival_score_pct" in ds["baseline_metrics"]
+    assert "cash_out_risk_pct" in ds["baseline_metrics"]
 
 
 def test_get_dataset_not_found(db_session):
@@ -207,245 +209,200 @@ def test_get_dataset_not_found(db_session):
 # POST /decisions
 # ---------------------------------------------------------------------------
 
-FINANCIAL_PROMPTS = [
-    "Buy a ₹1.2L laptop on EMI without dropping below ₹30k emergency savings",
-    "Buy 40 GPU lab PCs for ₹60L without dropping below ₹25L reserve",
-]
+LAPTOP_PROMPT = "Buy a ₹1.2L laptop on EMI without dropping below ₹30k emergency savings"
+FORK_TYPES = {"upfront", "emi", "phased", "trim"}
+
+
+def _wait_for_run(run_id: str, db_session, timeout: float = 20.0) -> dict:
+    deadline = time.time() + timeout
+    run = {}
+    while time.time() < deadline:
+        db_session.expire_all()
+        run = routes.get_run_status(run_id, db=db_session)
+        if run["overall_status"] in ("done", "failed"):
+            return run
+        time.sleep(0.2)
+    raise AssertionError(f"Run {run_id} did not finish in {timeout}s: {run}")
+
 
 @pytest.fixture(scope="module")
 def decision_id(committed_dataset_id, db_session):
-    req = routes.CreateDecisionRequest(
-        text=FINANCIAL_PROMPTS[0],
-        dataset_id=committed_dataset_id,
-    )
+    req = routes.CreateDecisionRequest(text=LAPTOP_PROMPT, dataset_id=committed_dataset_id)
+    return routes.create_decision(req, db=db_session)["id"]
+
+
+def test_create_decision_parses_amounts(committed_dataset_id, db_session):
+    req = routes.CreateDecisionRequest(text=LAPTOP_PROMPT, dataset_id=committed_dataset_id)
     spec = routes.create_decision(req, db=db_session)
-    return spec["id"]
+    assert spec["id"].startswith("dec_")
+    assert spec["status"] == "ok"
+    assert spec["change"]["params"]["total_cost"] == 120000.0
+    assert spec["change"]["params"]["emergency_floor"] == 30000.0
 
 
-def test_create_decision_returns_spec(committed_dataset_id, db_session):
-    req = routes.CreateDecisionRequest(
-        text=FINANCIAL_PROMPTS[0],
-        dataset_id=committed_dataset_id,
-    )
+def test_create_decision_ids_are_unique(committed_dataset_id, db_session):
+    req = routes.CreateDecisionRequest(text=LAPTOP_PROMPT, dataset_id=committed_dataset_id)
+    a = routes.create_decision(req, db=db_session)["id"]
+    b = routes.create_decision(req, db=db_session)["id"]
+    assert a != b
+
+
+def test_create_decision_without_amount_needs_clarification(committed_dataset_id, db_session):
+    req = routes.CreateDecisionRequest(text="Should we buy something nice?", dataset_id=committed_dataset_id)
     spec = routes.create_decision(req, db=db_session)
-    assert "id" in spec
-    assert spec["id"].startswith("dec_") or len(spec["id"]) >= 6
-    assert "status" in spec
-    assert spec["status"] in ("ok", "needs_clarification", "unsupported")
-    # routes.py normalises "financial" key -> "change"; accept both
-    assert "change" in spec or "financial" in spec
-    if "change" in spec:
-        assert "type" in spec["change"]
-
-
+    assert spec["status"] == "needs_clarification"
+    assert spec["message"]
+    # Forking an unclear decision is rejected rather than evaluated with made-up inputs
+    with pytest.raises(Exception) as exc_info:
+        routes.generate_scenarios_endpoint(spec["id"], db=db_session)
+    assert "DECISION_NOT_READY" in str(exc_info.value)
 
 
 def test_create_decision_dataset_not_found(db_session):
-    req = routes.CreateDecisionRequest(
-        text="Buy a laptop",
-        dataset_id="ds_nonexistent",
-    )
+    req = routes.CreateDecisionRequest(text="Buy a laptop", dataset_id="ds_nonexistent")
     with pytest.raises(Exception) as exc_info:
         routes.create_decision(req, db=db_session)
-    assert "DATASET_NOT_FOUND" in str(exc_info.value) or "404" in str(exc_info.value)
+    assert "DATASET_NOT_FOUND" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
-# POST /decisions/{id}/scenarios  — 4 competing policy forks
+# POST /decisions/{id}/scenarios — baseline + 4 forks
 # ---------------------------------------------------------------------------
 
 def test_generate_scenarios(decision_id, db_session):
     scenarios = routes.generate_scenarios_endpoint(decision_id, db=db_session)
-    assert isinstance(scenarios, list)
-    assert len(scenarios) >= 1
-    # Baseline must always be present
-    ids = [s["id"] for s in scenarios]
-    assert "baseline" in ids
+    types = [s["change"]["type"] for s in scenarios]
+    assert types[0] == "baseline"
+    assert set(types[1:]) == FORK_TYPES
+    # Scenario ids are namespaced by decision so decisions never overwrite each other
+    assert all(s["id"].startswith(decision_id) for s in scenarios)
+    # The trim fork receives the real dataset (flexible categories resolved)
+    trim = next(s for s in scenarios if s["change"]["type"] == "trim")
+    assert trim["status"] == "queued"
+    assert trim["change"]["params"]["flexible_categories"]
 
 
 def test_generate_scenarios_decision_not_found(db_session):
     with pytest.raises(Exception) as exc_info:
         routes.generate_scenarios_endpoint("dec_nonexistent", db=db_session)
-    assert "DECISION_NOT_FOUND" in str(exc_info.value) or "404" in str(exc_info.value)
+    assert "DECISION_NOT_FOUND" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
-# POST /decisions/{id}/run  &  GET /runs/{id}
+# Run → results → compare
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
-def run_id(decision_id, db_session):
-    # Ensure scenarios exist first
-    routes.generate_scenarios_endpoint(decision_id, db=db_session)
-    res = routes.start_run(decision_id, db=db_session)
-    return res["run_id"]
+def finished_run(decision_id, db_session):
+    run_id = routes.start_run(decision_id, db=db_session)["run_id"]
+    return _wait_for_run(run_id, db_session)
 
 
-def test_start_run_returns_run_id(run_id):
-    assert run_id.startswith("run_")
+def test_run_evaluates_every_fork(finished_run):
+    assert finished_run["run_id"].startswith("run_")
+    assert finished_run["overall_status"] == "done"
+    assert set(finished_run["scenarios"].values()) == {"done"}
+    assert len(finished_run["scenarios"]) == 5
 
 
-def test_get_run_status(run_id, db_session):
-    status_res = routes.get_run_status(run_id, db=db_session)
-    assert status_res["run_id"] == run_id
-    assert status_res["overall_status"] in ("queued", "running", "done", "failed")
+def test_scenario_results_come_from_engine(decision_id, finished_run, db_session):
+    for branch in ["baseline", *FORK_TYPES]:
+        res = routes.get_scenario_result(f"{decision_id}_{branch}", db=db_session)
+        assert res["branch_type"] == branch
+        assert res["solver"]["solver"].startswith(("OR-Tools-CP-SAT", "Deterministic-Audit"))
+        assert res["simulation"]["n_runs"] == 300
+        assert len(res["simulation"]["monthly_balances"]) == 12
+        assert len(res["cash_flow"]["months"]) == 12
+        assert res["cash_flow"]["categories"]
+        assert 0.0 <= res["metrics"]["survival_score_pct"] <= 100.0
+    upfront = routes.get_scenario_result(f"{decision_id}_upfront", db=db_session)
+    assert upfront["metrics"]["total_purchase_cost"] == 120000.0
 
 
-def test_run_completes_within_timeout(run_id, db_session):
-    """Poll run until done or 10s timeout — pipeline must finish."""
-    deadline = time.time() + 10.0
-    result = {}
-    while time.time() < deadline:
-        result = routes.get_run_status(run_id, db=db_session)
-        if result["overall_status"] in ("done", "failed"):
-            break
-        time.sleep(0.3)
-    # Accept done or failed (failed only if engine modules are stubs)
-    assert result["overall_status"] in ("done", "failed", "queued", "running")
-
-
-# ---------------------------------------------------------------------------
-# GET /scenarios/{id}/result
-# ---------------------------------------------------------------------------
-
-def test_get_scenario_result_baseline(run_id, decision_id, db_session):
-    """After a run, the baseline scenario result should be retrievable."""
-    # Give pipeline a moment if still running
-    deadline = time.time() + 10.0
-    while time.time() < deadline:
-        run = routes.get_run_status(run_id, db=db_session)
-        if run["overall_status"] in ("done", "failed"):
-            break
-        time.sleep(0.4)
-
-    try:
-        res = routes.get_scenario_result("baseline", db=db_session)
-        assert "scenario_id" in res
-        assert "metrics" in res
-        assert "simulation" in res
-    except Exception as exc:
-        # Acceptable if pipeline is still in flight or stubs are active
-        assert "RESULT_NOT_FOUND" in str(exc) or "404" in str(exc)
-
-
-# ---------------------------------------------------------------------------
-# GET /decisions/{id}/compare
-# ---------------------------------------------------------------------------
-
-def test_comparison_endpoint(decision_id, run_id, db_session):
-    # Give the pipeline time to finish
-    deadline = time.time() + 12.0
-    while time.time() < deadline:
-        run = routes.get_run_status(run_id, db=db_session)
-        if run["overall_status"] in ("done", "failed"):
-            break
-        time.sleep(0.4)
-
+def test_comparison_endpoint(decision_id, finished_run, db_session):
     comp = routes.get_decision_comparison(decision_id, db=db_session)
     assert comp["decision_id"] == decision_id
-    assert "scenarios" in comp
-    assert "results" in comp
-    assert "explanation" in comp
+    assert len(comp["results"]) == 5
+    assert comp["explanation"]["summary"]
+    assert comp["explanation"]["guard_passed"] is True
 
 
-# ---------------------------------------------------------------------------
-# POST /scenarios/{id}/branch  — Phase-2 child branch
-# ---------------------------------------------------------------------------
-
-def test_branch_scenario(decision_id, db_session):
-    """Branch off baseline into a custom child scenario."""
-    # Ensure baseline exists in DB first
-    routes.generate_scenarios_endpoint(decision_id, db=db_session)
-
-    req = routes.BranchScenarioRequest(
-        name="Custom: Delay Purchase 3 Months",
-        change={
-            "type": "phased_delay",
-            "params": {"delay_months": 3, "split_pct": 50},
-        },
+def test_decisions_do_not_overwrite_each_other(committed_dataset_id, decision_id, finished_run, db_session):
+    other = routes.create_decision(
+        routes.CreateDecisionRequest(
+            text="Buy a ₹40k phone without dropping below ₹20k savings",
+            dataset_id=committed_dataset_id,
+        ),
+        db=db_session,
     )
-    try:
-        child = routes.branch_scenario_endpoint("baseline", req, db=db_session)
-        assert child["parent_id"] == "baseline"
-        assert child["name"] == "Custom: Delay Purchase 3 Months"
-        assert child["id"].startswith("branch_")
-    except Exception as exc:
-        # 404 is acceptable when baseline isn't yet in DB in this isolated session
-        assert "PARENT_NOT_FOUND" in str(exc) or "404" in str(exc)
+    routes.generate_scenarios_endpoint(other["id"], db=db_session)
+    _wait_for_run(routes.start_run(other["id"], db=db_session)["run_id"], db_session)
+
+    first = routes.get_scenario_result(f"{decision_id}_upfront", db=db_session)
+    second = routes.get_scenario_result(f"{other['id']}_upfront", db=db_session)
+    assert first["metrics"]["total_purchase_cost"] == 120000.0
+    assert second["metrics"]["total_purchase_cost"] == 40000.0
+    assert len(routes.get_decision_comparison(decision_id, db=db_session)["results"]) == 5
+
+
+def test_get_scenario_result_not_found(db_session):
+    with pytest.raises(Exception) as exc_info:
+        routes.get_scenario_result("dec_missing_baseline", db=db_session)
+    assert "RESULT_NOT_FOUND" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# POST /scenarios/{id}/branch — user-defined child fork
+# ---------------------------------------------------------------------------
+
+def test_branch_scenario(decision_id, finished_run, db_session):
+    parent_id = f"{decision_id}_baseline"
+    req = routes.BranchScenarioRequest(
+        name="Custom: 12-month EMI",
+        change={"type": "emi", "params": {"emi_months": 12}},
+    )
+    child = routes.branch_scenario_endpoint(parent_id, req, db=db_session)
+    assert child["parent_id"] == parent_id
+    assert child["id"].startswith("branch_")
+    assert child["status"] == "done"
+    res = routes.get_scenario_result(child["id"], db=db_session)
+    assert res["branch_type"] == "emi"
+    assert res["metrics"]["total_financing_interest"] > 0
+
+
+def test_branch_scenario_rejects_unknown_type(decision_id, finished_run, db_session):
+    req = routes.BranchScenarioRequest(name="Bad", change={"type": "shift_time_window", "params": {}})
+    with pytest.raises(Exception) as exc_info:
+        routes.branch_scenario_endpoint(f"{decision_id}_baseline", req, db=db_session)
+    assert "UNSUPPORTED_CHANGE" in str(exc_info.value)
 
 
 def test_branch_scenario_parent_not_found(db_session):
-    req = routes.BranchScenarioRequest(
-        name="Orphan Branch",
-        change={"type": "upfront_buy", "params": {}},
-    )
+    req = routes.BranchScenarioRequest(name="Orphan Branch", change={"type": "upfront", "params": {}})
     with pytest.raises(Exception) as exc_info:
         routes.branch_scenario_endpoint("scenario_nonexistent_xyz", req, db=db_session)
-    assert "PARENT_NOT_FOUND" in str(exc_info.value) or "404" in str(exc_info.value)
+    assert "PARENT_NOT_FOUND" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
-# Full E2E flow in a single test
+# Infeasible decision: forks fail honestly instead of showing placeholder numbers
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_full_financial_pipeline(db_session):
-    """
-    Smoke test: upload → inspect → commit → decision → scenarios → run → compare
-    Validates the complete Member 5 pipeline in one shot.
-    """
-    import io as _io
-
-    from fastapi import UploadFile
-
-    # 1. Inspect
-    csv_bytes = _make_minimal_csv()
-    file = UploadFile(filename="e2e_test.csv", file=_io.BytesIO(csv_bytes))
-    inspect_res = await routes.inspect_dataset(file=file, db=db_session)
-    assert inspect_res["upload_id"].startswith("upl_")
-
-    # 2. Commit
-    commit_req = routes.CommitRequest(
-        upload_id=inspect_res["upload_id"],
-        confirmed_mapping=inspect_res["proposed_mapping"],
-        dataset_name="E2E Test Dataset",
-        starting_balance=100000.0,
+def test_unaffordable_purchase_fails_forks_not_baseline(committed_dataset_id, db_session):
+    # ₹60L against a ₹50k opening balance fails the fan-out sanity check (> 10x balance)
+    dec = routes.create_decision(
+        routes.CreateDecisionRequest(
+            text="Buy a ₹60L GPU cluster on EMI without dropping below ₹25L reserve",
+            dataset_id=committed_dataset_id,
+        ),
+        db=db_session,
     )
-    commit_res = routes.commit_dataset(commit_req, db=db_session)
-    dataset_id = commit_res["dataset_id"]
-    assert dataset_id.startswith("ds_")
+    scenarios = routes.generate_scenarios_endpoint(dec["id"], db=db_session)
+    statuses = {s["change"]["type"]: s["status"] for s in scenarios}
+    assert statuses["baseline"] == "queued"
+    assert all(statuses[t] == "failed" for t in FORK_TYPES)
 
-    # 3. Decision
-    dec_req = routes.CreateDecisionRequest(
-        text="Buy a ₹60L GPU cluster on EMI without dropping below ₹25L reserve",
-        dataset_id=dataset_id,
-    )
-    dec = routes.create_decision(dec_req, db=db_session)
-    dec_id = dec["id"]
-    assert dec["status"] in ("ok", "needs_clarification", "unsupported")
-
-    # 4. Scenarios
-    scenarios = routes.generate_scenarios_endpoint(dec_id, db=db_session)
-    assert len(scenarios) >= 1
-    assert scenarios[0]["id"] == "baseline"
-
-    # 5. Run
-    run_res = routes.start_run(dec_id, db=db_session)
-    run_id = run_res["run_id"]
-    assert run_id.startswith("run_")
-
-    # 6. Poll
-    deadline = time.time() + 12.0
-    while time.time() < deadline:
-        run_status = routes.get_run_status(run_id, db=db_session)
-        if run_status["overall_status"] in ("done", "failed"):
-            break
-        time.sleep(0.3)
-
-    # 7. Compare
-    comp = routes.get_decision_comparison(dec_id, db=db_session)
-    assert comp["decision_id"] == dec_id
-    assert "explanation" in comp
-
-    print(f"\n[E2E] Pipeline complete — dataset_id={dataset_id}, run_id={run_id}, "
-          f"status={run_status['overall_status']}")
+    run = _wait_for_run(routes.start_run(dec["id"], db=db_session)["run_id"], db_session)
+    assert run["scenarios"][f"{dec['id']}_baseline"] == "done"
+    comp = routes.get_decision_comparison(dec["id"], db=db_session)
+    assert list(comp["results"]) == [f"{dec['id']}_baseline"]

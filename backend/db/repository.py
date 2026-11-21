@@ -1,9 +1,11 @@
 """
 FutureFork Database Repository & Seeder
-Member 5: Added upload/commit methods for the CSV inspect→commit pipeline.
+Persists uploads, datasets, decisions, scenarios, runs, results and the result cache.
+Seeds the bundled sample CSVs as ready-to-use financial datasets on startup.
 """
 
 import base64
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -19,28 +21,80 @@ from backend.db.models import (
     UploadModel,
 )
 from backend.db.session import Base, SessionLocal, engine
-from data.loader import default_loader
+
+logger = logging.getLogger("futurefork.db")
+
+# Bundled sample CSVs seeded as ready-to-use datasets: (dataset_id, csv name, display name, type)
+SAMPLE_DATASETS = [
+    ("sample_personal", "personal_upi.csv", "Sample: Personal UPI Statement", "personal"),
+    ("sample_institute", "institute_erp_1.8cr.csv", "Sample: Institute ERP Ledger (~₹1.8 Cr)", "institute"),
+    ("sample_startup", "startup_pnl.csv", "Sample: Startup P&L / Burn", "startup"),
+]
+
+
+def build_dataset_record(
+    instance: Any,
+    dataset_id: str,
+    name: str,
+    dataset_type: str,
+    source_filename: str,
+    column_mapping: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Builds the persisted dataset record (summary + compiled instance + Node 0 metrics)."""
+    from engine.solver import attach_simulation, evaluate_financial_baseline
+
+    instance.dataset_id = dataset_id
+    instance.name = name
+    baseline = attach_simulation(evaluate_financial_baseline(instance, emergency_floor=0.0), instance)
+    stats = {
+        "months": len(instance.months),
+        "categories": len(instance.categories),
+        "starting_balance": instance.starting_balance,
+        "total_inflow": round(float(sum(instance.inflows)), 2),
+        "total_outflow": round(float(sum(instance.total_outflows)), 2),
+        "category_types": instance.category_types,
+    }
+    description = f"Financial dataset compiled from {source_filename}"
+    summary = {
+        "id": dataset_id,
+        "name": name,
+        "description": description,
+        "dataset_type": dataset_type,
+        "stats": stats,
+        "baseline_metrics": baseline.metrics,
+    }
+    return {
+        "id": dataset_id,
+        "name": name,
+        "description": description,
+        "stats": stats,
+        "baseline_metrics": baseline.metrics,
+        "payload": {
+            "summary": summary,
+            "instance": instance.to_dict(),
+            "column_mapping": column_mapping or {},
+            "source_filename": source_filename,
+        },
+    }
 
 
 def init_db():
     Base.metadata.create_all(bind=engine)
-    # Seed default dataset if not present
     db = SessionLocal()
     try:
-        existing = db.query(DatasetModel).filter(DatasetModel.id == "sample_univ_v1").first()
-        if not existing:
-            bundle = default_loader.load_bundle()
-            summary = bundle["summary"]
-            ds = DatasetModel(
-                id=summary["id"],
-                name=summary["name"],
-                description=summary["description"],
-                stats=summary["stats"],
-                baseline_metrics=summary["baseline_metrics"],
-                payload=bundle,
-            )
-            db.add(ds)
-            db.commit()
+        repo = Repository(db)
+        for dataset_id, csv_name, display_name, dataset_type in SAMPLE_DATASETS:
+            if repo.get_dataset(dataset_id):
+                continue
+            try:
+                from data.loader import load_sample_instance
+
+                instance = load_sample_instance(csv_name)
+                repo.save_dataset(
+                    build_dataset_record(instance, dataset_id, display_name, dataset_type, csv_name)
+                )
+            except Exception as exc:  # a broken sample must not stop the API from starting
+                logger.warning("Could not seed sample dataset %s: %s", dataset_id, exc)
     finally:
         db.close()
 
@@ -254,29 +308,20 @@ class Repository:
     # ------------------------------------------------------------------
 
     def save_result(self, result: Dict[str, Any]):
+        """Stores a raw engine result (see integrations.call_evaluate_scenario)."""
         model = ResultModel(
             scenario_id=result["scenario_id"],
-            solver=result["solver"],
-            metrics=result["metrics"],
-            simulation=result["simulation"],
-            timetable=result["timetable"],
-            explanation=result.get("explanation"),
+            decision_id=result.get("decision_id"),
+            branch_type=result.get("branch_type"),
+            payload=result,
         )
         self.db.merge(model)
         self.db.commit()
 
     def get_result(self, scenario_id: str) -> Optional[Dict[str, Any]]:
+        """Returns the raw engine result dict for a scenario, or None."""
         r = self.db.query(ResultModel).filter(ResultModel.scenario_id == scenario_id).first()
-        if not r:
-            return None
-        return {
-            "scenario_id": r.scenario_id,
-            "solver": r.solver,
-            "metrics": r.metrics,
-            "simulation": r.simulation,
-            "timetable": r.timetable,
-            "explanation": r.explanation,
-        }
+        return dict(r.payload) if r else None
 
     # ------------------------------------------------------------------
     # Caching

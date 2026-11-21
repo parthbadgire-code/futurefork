@@ -9,14 +9,13 @@ Public API:
   build_forks(prompt, baseline, dataset_type="personal") -> ForkSet
 
 Backward compat:
-  generate_scenarios(decision_spec) -> list[dict]  (old timetable stub)
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("futurefork.ai.agents.scenario")
@@ -152,7 +151,12 @@ def _apply_fork(
     Returns:
         ForkSpec with status "ready" or "error".
     """
-    from engine.changes import apply_upfront, apply_emi_split, apply_phased_delay, apply_discretionary_trim
+    from engine.changes import (
+        apply_discretionary_trim,
+        apply_emi_split,
+        apply_phased_delay,
+        apply_upfront,
+    )
 
     _APPLIERS = {
         "upfront": apply_upfront,
@@ -213,7 +217,7 @@ def _build_forks_plain(
     Returns:
         ForkSet with exactly 4 forks.
     """
-    from ai.agents.parser import parse_financial_decision, DecisionParseError
+    from ai.agents.parser import DecisionParseError, parse_financial_decision
 
     # Node: parse
     try:
@@ -292,12 +296,13 @@ def _try_build_forks_langgraph(
     Returns ForkSet or None if LangGraph is not available.
     """
     try:
-        from langgraph.graph import StateGraph, END
         from typing import TypedDict
+
+        from langgraph.graph import END, StateGraph
     except ImportError:
         return None
 
-    from ai.agents.parser import parse_financial_decision, DecisionParseError
+    from ai.agents.parser import DecisionParseError, parse_financial_decision
 
     # State schema
     class _State(TypedDict, total=False):
@@ -487,33 +492,3 @@ def build_forks(
     result = _build_forks_plain(prompt, baseline, dataset_type)
     logger.info("scenario: used plain Python fan-out")
     return result
-
-
-# ===========================================================================
-# Backward compatibility stub (old timetable scenario generator)
-# ===========================================================================
-
-
-def generate_scenarios(decision_spec: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    DEPRECATED stub kept for backward compatibility with old timetable routes.
-    Returns old-format scenario list.
-    """
-    import warnings
-    warnings.warn(
-        "generate_scenarios() is deprecated. Use build_forks() instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    dec_id = decision_spec.get("id", "dec_001")
-    return [
-        {
-            "id": "baseline",
-            "decision_id": dec_id,
-            "parent_id": None,
-            "name": "Baseline (Current)",
-            "description": "Current state without any change.",
-            "change": {"type": "shift_time_window", "params": {}},
-            "status": "queued",
-        }
-    ]

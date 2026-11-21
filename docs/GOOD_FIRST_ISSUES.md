@@ -1,93 +1,83 @@
 # 🌟 FutureFork Good First Issues
 
-Looking to contribute to FutureFork? Here is a curated list of beginner-friendly and intermediate issues across frontend, backend, engine, and AI agent domains.
+Beginner-friendly and intermediate issues across the engine, AI layer, backend and frontend. Several are real bugs found while connecting the UI to the live engine.
 
 ---
 
-### 1. 🏥 Hospital Nurse Shift Scheduling Domain Adapter
-- **Area**: `engine/` & `ai/catalog.py`
-- **Difficulty**: Intermediate
-- **Goal**: Add a domain schema and change types for hospital nurse rostering (`shift_nurses`, `ward_cap`, `night_shift_rotation`).
-- **Files Involved**: `ai/catalog.py`, `engine/model.py`, `engine/changes.py`
-- **Definition of Done**: A sample 14-day ward roster dataset with OR-Tools constraint checking nurse shifts and consecutive rest days.
-
----
-
-### 2. ✈️ Airport Gate Assignment Solver Extension
-- **Area**: `engine/`
-- **Difficulty**: Intermediate
-- **Goal**: Formulate gate allocation constraints (aircraft size vs gate bridge compatibility, minimum turnaround time).
-- **Files Involved**: `engine/solver.py`, `engine/metrics.py`
-- **Definition of Done**: Metric for gate idle time and passenger walking distance evaluated across flight arrivals.
-
----
-
-### 3. 🚶 Faculty Walking Distance & Building Proximity Metric
-- **Area**: `engine/metrics.py`
+### 1. 🐛 Explainer drops the minus sign on negative balances
+- **Area**: `ai/agents/explainer.py`
 - **Difficulty**: Beginner
-- **Goal**: Calculate inter-building transit penalties when a professor has consecutive classes in distant campus buildings.
-- **Files Involved**: `engine/metrics.py`, `engine/model.py`, `frontend/src/components/ComparisonDashboard.tsx`
-- **Definition of Done**: Metric `faculty_walking_meters` added to evaluation output and displayed on the comparison radar chart.
+- **Problem**: For an unaffordable plan, the template explanation says "min balance=₹17.62L" when the balance is **-₹17.62L**. The Numeric Guard compares absolute values, so it doesn't catch this.
+- **Definition of Done**: Negative balances render with a minus sign, and the guard rejects a sign mismatch. Add a test in `ai/evals/test_prompts.py`.
 
 ---
 
-### 4. ✂️ Split-Lecture Decision Change Type
-- **Area**: `ai/catalog.py` & `engine/changes.py`
+### 2. 🐛 Parser misses "keeping ₹X in reserve"
+- **Area**: `ai/agents/parser.py`
 - **Difficulty**: Beginner
-- **Goal**: Allow users to say *"Split 3-hour marathon lectures into two 1.5-hour sessions on alternate days"*.
-- **Files Involved**: `ai/catalog.py`, `ai/agents/parser.py`, `engine/changes.py`
-- **Definition of Done**: 100% parser detection on split-lecture queries and valid event splitting in `apply_split_lecture`.
+- **Problem**: *"Buy ₹12L of GPU servers on EMI while keeping ₹20L in reserve"* parses the emergency floor as ₹0. Only phrasings like "without dropping below ₹X" are recognised.
+- **Definition of Done**: "keeping/keep/maintain ₹X in reserve/savings/the bank" sets the floor. Add regression prompts to the eval suite.
 
 ---
 
-### 5. 🌙 Dark Mode Theme for Scenario Tree & Timetable Grid
+### 3. ⚖️ Let Trim & Buy choose its purchase month
+- **Area**: `engine/solver.py` (`solve_trim_branch`)
+- **Difficulty**: Intermediate
+- **Problem**: Trim always buys in the target month, while Upfront may move the purchase to a safer month, so Trim can end up worse than Upfront (for example, the ₹2L vacation on the personal sample).
+- **Definition of Done**: Trim jointly optimizes purchase month and cuts. Test: Trim's minimum balance is never below Upfront's for the same goal.
+
+---
+
+### 4. 🎛️ Make the Crisis Playground engine-backed
+- **Area**: `frontend/src/components/ComparisonDashboard.tsx`, `backend/api/routes.py`, `engine/simulator.py`
+- **Difficulty**: Intermediate
+- **Problem**: The stress sliders estimate survival scores in the browser with a hand-written formula, which bends the Golden Rule.
+- **Definition of Done**: Sliders call an endpoint that re-runs the Monte Carlo simulation with the chosen shock parameters (inflow delay, surprise outflow, drift).
+
+---
+
+### 5. 🌿 Custom branch UI
 - **Area**: `frontend/`
 - **Difficulty**: Beginner
-- **Goal**: Add a theme toggle supporting system preferences and dark mode styling for React Flow nodes, edge connections, and timetable cells.
-- **Files Involved**: `frontend/src/App.tsx`, `frontend/src/components/ScenarioTree.tsx`, `frontend/src/index.css`
-- **Definition of Done**: Smooth color transition with high-contrast accessibility compliance.
+- **Goal**: `POST /scenarios/{id}/branch` already evaluates a user-defined child fork (e.g. "EMI, but 6 months"). Add a "Branch from here" action on scenario cards.
+- **Definition of Done**: A child card appears under its parent with engine results.
 
 ---
 
-### 6. 📊 CSV & iCalendar (.ics) Timetable Export
-- **Area**: `frontend/` & `backend/api/`
+### 6. 📤 Export the winning plan
+- **Area**: `frontend/src/components/ComparisonDashboard.tsx`
 - **Difficulty**: Beginner
-- **Goal**: Provide a button on `TimetableGrid` to export the currently selected scenario schedule to `.csv` or `.ics` for Google Calendar / Apple Calendar import.
-- **Files Involved**: `frontend/src/components/TimetableGrid.tsx`, `backend/api/routes.py`
-- **Definition of Done**: Click-to-download functional file containing all 68 scheduled events with correct slot timestamps.
+- **Goal**: Export the selected fork's 12-month schedule (inflows, category outflows, purchase cash-out, closing balance) as CSV.
+- **Definition of Done**: The downloaded file matches `cash_flow` and `simulation.monthly_balances` exactly.
 
 ---
 
-### 7. 🎛️ Interactive Monte Carlo Parameter Sliders
-- **Area**: `frontend/` & `engine/simulator.py`
-- **Difficulty**: Beginner
-- **Goal**: Allow users in the Comparison Dashboard to adjust perturbation probabilities (e.g. sick leave rate: 2% &rarr; 8%, storm outage: 0% &rarr; 5%) and re-run the 300-run simulation in real time.
-- **Files Involved**: `frontend/src/components/ComparisonDashboard.tsx`, `backend/api/routes.py`
-- **Definition of Done**: Sliders update simulation box-plots without reloading the page.
-
----
-
-### 8. 🔔 Webhook / Slack Notification on Solver Completion
-- **Area**: `backend/`
-- **Difficulty**: Beginner
-- **Goal**: Add optional webhook dispatcher when large optimization runs or multi-scenario branch runs finish.
-- **Files Involved**: `backend/api/routes.py`, `backend/config.py`
-- **Definition of Done**: Configurable `WEBHOOK_URL` receives a JSON summary payload with scenario comparison deltas.
-
----
-
-### 9. 🧠 Multi-Turn Conversational Branch Refinement
-- **Area**: `ai/agents/parser.py`
+### 7. 🧾 New fork type: lease-to-own
+- **Area**: `engine/changes.py`, `engine/solver.py`, `ai/agents/scenario.py`
 - **Difficulty**: Intermediate
-- **Goal**: Allow users to click a scenario node and say *"Branch from this scenario, but relax room caps by 10%"*.
-- **Files Involved**: `ai/agents/parser.py`, `frontend/src/components/NodeDrawer.tsx`
-- **Definition of Done**: Parent scenario parameters inherit into child branch with differential prompt modifications.
+- **Goal**: Add a fifth strategy with monthly lease payments and an optional buy-out at month N. Follow "Adding a New Fork Type" in the README.
+- **Definition of Done**: The fork appears in the UI with solver-verified metrics and tests.
 
 ---
 
-### 10. ⚡ WebAssembly (Wasm) Client-Side Monte Carlo Simulation
-- **Area**: `frontend/` & `engine/`
+### 8. 📈 Longer horizons
+- **Area**: `data/ingestor.py`, `engine/`
 - **Difficulty**: Advanced
-- **Goal**: Compile the Monte Carlo simulation to Rust / Wasm for client-side zero-latency execution in browser memory.
-- **Files Involved**: `frontend/src/wasm/`, `engine/simulator.py`
-- **Definition of Done**: 300 runs executed in &lt; 50ms entirely inside the user's browser.
+- **Goal**: Support 24-month horizons (currently fixed at 12 months).
+- **Definition of Done**: Horizon is configurable end to end; all tests pass for 12 and 24.
+
+---
+
+### 9. 🗄️ Database migrations
+- **Area**: `backend/db/`
+- **Difficulty**: Intermediate
+- **Goal**: Add Alembic so schema changes don't require deleting the local SQLite database.
+- **Definition of Done**: `alembic upgrade head` creates the current schema; CI runs it.
+
+---
+
+### 10. 🔔 Webhook on run completion
+- **Area**: `backend/orchestration/runner.py`, `backend/settings.py`
+- **Difficulty**: Beginner
+- **Goal**: Optional `WEBHOOK_URL` receives a JSON summary when a decision run finishes.
+- **Definition of Done**: Payload includes each fork's survival score, cash-out risk and lowest balance.

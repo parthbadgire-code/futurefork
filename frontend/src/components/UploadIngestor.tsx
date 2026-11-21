@@ -1,46 +1,63 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useCallback, useRef, useState } from 'react';
+import { AlertTriangle, CheckCircle2, ChevronDown, Database, FileText, Loader2, Upload } from 'lucide-react';
 import { api } from '../api/client';
-import { InspectResponse, ColumnMapping, CommitRequest } from '../contracts/types';
-import { MOCK_FINANCIAL_DATASETS, MOCK_INSPECT_RESPONSE } from '../mocks/fixtures';
-import { Upload, FileText, ChevronDown, Lock, AlertTriangle, CheckCircle2, Loader2, Database } from 'lucide-react';
+import { ColumnMapping, ColumnRole, DatasetType, InspectResponse } from '../contracts/types';
+import { SAMPLE_DATASETS } from '../mocks/fixtures';
 
 interface UploadIngestorProps {
-  onCommit: (datasetId: string, name: string) => void;
-  onPresetLoad: (presetId: string) => void;
+  onDatasetReady: (datasetId: string, name: string, datasetType: DatasetType) => void;
 }
 
-const COLUMN_ROLE_OPTIONS = [
-  'date_col', 'amount_col', 'description_col', 'category_col', 'balance_col', 'ignore',
+const COLUMN_ROLES: ColumnRole[] = [
+  'date_col', 'amount_col', 'debit_col', 'credit_col', 'type_col', 'category_col', 'description_col',
 ];
 
-const COLUMN_ROLE_LABELS: Record<string, string> = {
+const ROLE_LABELS: Record<ColumnRole | 'ignore', string> = {
   date_col: '📅 Date',
-  amount_col: '₹ Amount',
-  description_col: '📝 Description',
+  amount_col: '₹ Signed / single amount',
+  debit_col: '↘ Debit (money out)',
+  credit_col: '↗ Credit (money in)',
+  type_col: '⇄ Type (inflow / outflow)',
   category_col: '🏷 Category',
-  balance_col: '💰 Balance',
+  description_col: '📝 Description',
   ignore: '✕ Ignore',
 };
 
-export const UploadIngestor: React.FC<UploadIngestorProps> = ({ onCommit, onPresetLoad }) => {
+const DATASET_TYPE_LABELS: Record<DatasetType, string> = {
+  personal: 'Personal',
+  institute: 'Institute',
+  startup: 'Startup',
+};
+
+export const UploadIngestor: React.FC<UploadIngestorProps> = ({ onDatasetReady }) => {
   const [isDragging, setIsDragging] = useState(false);
   const [inspectResult, setInspectResult] = useState<InspectResponse | null>(null);
-  const [columnMapping, setColumnMapping] = useState<ColumnMapping | null>(null);
+  const [mapping, setMapping] = useState<ColumnMapping | null>(null);
+  const [datasetType, setDatasetType] = useState<DatasetType>('personal');
   const [openingBalance, setOpeningBalance] = useState('');
-  const [emergencyFloor, setEmergencyFloor] = useState('');
-  const [datasetName, setDatasetName] = useState('My Financial Data');
+  const [datasetName, setDatasetName] = useState('');
   const [isInspecting, setIsInspecting] = useState(false);
   const [isCommitting, setIsCommitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [committed, setCommitted] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const handleDragOver = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(true);
-  }, []);
-
-  const handleDragLeave = useCallback(() => setIsDragging(false), []);
+  const processFile = async (file: File) => {
+    setError(null);
+    setIsInspecting(true);
+    setInspectResult(null);
+    try {
+      const result = await api.inspectDataset(file);
+      setInspectResult(result);
+      setMapping(result.proposed_mapping);
+      setDatasetType(result.dataset_type);
+      setDatasetName(file.name.replace(/\.csv$/i, '').replace(/[_-]+/g, ' '));
+      setOpeningBalance('');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to inspect file');
+    } finally {
+      setIsInspecting(false);
+    }
+  };
 
   const handleDrop = useCallback(async (e: React.DragEvent) => {
     e.preventDefault();
@@ -49,137 +66,85 @@ export const UploadIngestor: React.FC<UploadIngestorProps> = ({ onCommit, onPres
     if (file) await processFile(file);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const handleFileInput = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) await processFile(file);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const roleOf = (col: string): ColumnRole | 'ignore' =>
+    (mapping && COLUMN_ROLES.find((r) => mapping[r] === col)) || 'ignore';
 
-  const processFile = async (file: File) => {
-    setError(null);
-    setIsInspecting(true);
-    setInspectResult(null);
-    setCommitted(false);
-    try {
-      const result = await api.inspectDataset(file);
-      setInspectResult(result);
-      setColumnMapping(result.column_mapping);
-      setOpeningBalance('');
-      setEmergencyFloor('');
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to inspect file');
-    } finally {
-      setIsInspecting(false);
-    }
-  };
-
-  const handlePreset = (preset: typeof MOCK_FINANCIAL_DATASETS[0]) => {
-    setInspectResult(MOCK_INSPECT_RESPONSE);
-    setColumnMapping(MOCK_INSPECT_RESPONSE.column_mapping);
-    setOpeningBalance(preset.opening_balance.toString());
-    setEmergencyFloor(preset.emergency_floor.toString());
-    setDatasetName(preset.name);
-    setCommitted(false);
-    onPresetLoad(preset.id);
-  };
-
-  const handleColumnRoleChange = (colName: string, role: string) => {
-    if (!columnMapping) return;
-    const updated: ColumnMapping = { ...columnMapping };
-    // Reset any existing assignment of this role
-    const roleKeys: (keyof ColumnMapping)[] = ['date_col', 'amount_col', 'description_col', 'category_col', 'balance_col'];
-    roleKeys.forEach((k) => {
-      if (updated[k] === colName && k !== role) {
-        (updated[k] as string) = '';
-      }
+  const setRole = (col: string, role: ColumnRole | 'ignore') => {
+    if (!mapping) return;
+    const next: ColumnMapping = { ...mapping };
+    COLUMN_ROLES.forEach((r) => {
+      if (next[r] === col) (next[r] as string | null) = r === 'date_col' ? '' : null;
     });
-    if (role !== 'ignore') {
-      (updated[role as keyof ColumnMapping] as string) = colName;
-    }
-    setColumnMapping(updated);
+    if (role !== 'ignore') (next[role] as string | null) = col;
+    setMapping(next);
   };
 
-  const getColumnRole = (colName: string): string => {
-    if (!columnMapping) return 'ignore';
-    if (columnMapping.date_col === colName) return 'date_col';
-    if (columnMapping.amount_col === colName) return 'amount_col';
-    if (columnMapping.description_col === colName) return 'description_col';
-    if (columnMapping.category_col === colName) return 'category_col';
-    if (columnMapping.balance_col === colName) return 'balance_col';
-    return 'ignore';
-  };
+  const hasAmounts = !!mapping && (!!mapping.amount_col || !!mapping.debit_col || !!mapping.credit_col);
 
   const handleCommit = async () => {
-    if (!inspectResult || !columnMapping) return;
-    const ob = parseFloat(openingBalance.replace(/,/g, ''));
-    const ef = parseFloat(emergencyFloor.replace(/,/g, ''));
-    if (isNaN(ob) || isNaN(ef)) {
-      setError('Please enter valid opening balance and emergency floor amounts.');
+    if (!inspectResult || !mapping) return;
+    const balance = openingBalance.trim() ? parseFloat(openingBalance.replace(/[,₹\s]/g, '')) : undefined;
+    if (balance !== undefined && isNaN(balance)) {
+      setError('Opening balance must be a number, e.g. 285000.');
       return;
     }
     setIsCommitting(true);
     setError(null);
     try {
-      const payload: CommitRequest = {
-        dataset_id: inspectResult.dataset_id,
-        name: datasetName,
-        column_mapping: columnMapping,
-        opening_balance: ob,
-        emergency_floor: ef,
-      };
-      const result = await api.commitDataset(payload);
-      setCommitted(true);
-      onCommit(result.dataset_id, result.name);
+      const result = await api.commitDataset({
+        upload_id: inspectResult.upload_id,
+        confirmed_mapping: mapping,
+        dataset_name: datasetName || undefined,
+        starting_balance: balance,
+        dataset_type: datasetType,
+      });
+      onDatasetReady(result.dataset_id, result.name, result.dataset_type);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to commit dataset');
+      setError(err instanceof Error ? err.message : 'Failed to build the baseline');
     } finally {
       setIsCommitting(false);
     }
   };
 
-  const fmtRs = (n: number) => `₹${n.toLocaleString('en-IN')}`;
-
   return (
     <div className="space-y-6">
-      {/* Preset Buttons */}
+      {/* Sample datasets */}
       <div className="glass-card p-5">
         <div className="text-xs font-bold uppercase tracking-widest text-slate-400 mb-3 flex items-center gap-2">
           <Database className="w-3.5 h-3.5" />
-          Quick Start — Load Sample Dataset
+          Quick Start: Use a Sample Dataset
         </div>
-        <div className="flex flex-wrap gap-2">
-          {MOCK_FINANCIAL_DATASETS.map((preset) => (
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+          {SAMPLE_DATASETS.map((preset) => (
             <button
               key={preset.id}
-              onClick={() => handlePreset(preset)}
-              className="px-4 py-2 rounded-xl text-xs font-semibold border border-white/10 bg-white/5
-                         text-slate-300 hover:bg-emerald-500/15 hover:border-emerald-500/40 hover:text-emerald-300
-                         transition-all duration-200"
+              onClick={() => onDatasetReady(preset.id, preset.name, preset.dataset_type)}
+              className="p-3 rounded-xl text-left border border-white/10 bg-white/5 hover:bg-emerald-500/10
+                         hover:border-emerald-500/40 transition-all duration-200"
             >
-              {preset.label}
+              <div className="text-xs font-semibold text-slate-200">{preset.label}</div>
+              <div className="text-[11px] text-slate-500 mt-1 leading-snug">{preset.description}</div>
             </button>
           ))}
         </div>
       </div>
 
-      {/* Upload Zone */}
+      {/* Upload zone */}
       <div
-        onDragOver={handleDragOver}
-        onDragLeave={handleDragLeave}
+        onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+        onDragLeave={() => setIsDragging(false)}
         onDrop={handleDrop}
         onClick={() => fileInputRef.current?.click()}
         className={`glass-card p-10 flex flex-col items-center justify-center gap-4 cursor-pointer
                     border-2 border-dashed transition-all duration-200 rounded-2xl
-                    ${isDragging
-                      ? 'border-emerald-500/60 bg-emerald-500/10 shadow-glow'
-                      : 'border-white/15 hover:border-emerald-500/40 hover:bg-white/8'
-                    }`}
+                    ${isDragging ? 'border-emerald-500/60 bg-emerald-500/10 shadow-glow' : 'border-white/15 hover:border-emerald-500/40 hover:bg-white/8'}`}
       >
         <input
           ref={fileInputRef}
           type="file"
-          accept=".csv,.xlsx,.xls"
+          accept=".csv"
           className="hidden"
-          onChange={handleFileInput}
+          onChange={async (e) => { const f = e.target.files?.[0]; if (f) await processFile(f); }}
         />
         {isInspecting ? (
           <div className="flex flex-col items-center gap-3">
@@ -188,26 +153,17 @@ export const UploadIngestor: React.FC<UploadIngestorProps> = ({ onCommit, onPres
           </div>
         ) : (
           <>
-            <div className={`w-16 h-16 rounded-2xl flex items-center justify-center transition-colors
-                            ${isDragging ? 'bg-emerald-500/20' : 'bg-white/5'}`}>
+            <div className={`w-16 h-16 rounded-2xl flex items-center justify-center ${isDragging ? 'bg-emerald-500/20' : 'bg-white/5'}`}>
               <Upload className={`w-8 h-8 ${isDragging ? 'text-emerald-400' : 'text-slate-500'}`} />
             </div>
             <div className="text-center space-y-1">
-              <p className="text-sm font-semibold text-slate-300">
-                Drop your CSV / Excel here
-              </p>
-              <p className="text-xs text-slate-500">
-                or click to browse • Bank statements, P&L, UPI exports
-              </p>
+              <p className="text-sm font-semibold text-slate-300">Drop your CSV here</p>
+              <p className="text-xs text-slate-500">or click to browse: bank / UPI statements, ERP ledgers, P&L exports</p>
             </div>
-            <span className="text-[10px] font-mono text-slate-600 border border-white/8 rounded-lg px-3 py-1 bg-white/3">
-              .csv · .xlsx · .xls
-            </span>
           </>
         )}
       </div>
 
-      {/* Error */}
       {error && (
         <div className="flex items-center gap-2 px-4 py-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-400 text-sm">
           <AlertTriangle className="w-4 h-4 shrink-0" />
@@ -215,47 +171,38 @@ export const UploadIngestor: React.FC<UploadIngestorProps> = ({ onCommit, onPres
         </div>
       )}
 
-      {/* Inspect Result */}
-      {inspectResult && columnMapping && (
+      {inspectResult && mapping && (
         <div className="space-y-5 animate-in fade-in">
-          {/* File summary */}
-          <div className="glass-card p-4 flex flex-wrap gap-4 text-xs">
-            <div className="flex items-center gap-2">
-              <FileText className="w-4 h-4 text-slate-500" />
-              <span className="text-slate-400">{inspectResult.filename}</span>
-            </div>
+          <div className="glass-card p-4 flex flex-wrap items-center gap-3 text-xs text-slate-400">
+            <FileText className="w-4 h-4 text-slate-500" />
+            <span>{inspectResult.filename}</span>
             <span className="text-slate-600">|</span>
-            <span className="text-slate-400">{inspectResult.row_count} rows</span>
+            <span>{inspectResult.headers.length} columns</span>
             <span className="text-slate-600">|</span>
-            <span className="text-slate-400">{inspectResult.date_range.start} → {inspectResult.date_range.end}</span>
-            <span className="text-slate-600">|</span>
-            <span className="text-emerald-400 font-mono tabular-nums">In: {fmtRs(inspectResult.total_inflow)}</span>
-            <span className="text-rose-400 font-mono tabular-nums">Out: {fmtRs(inspectResult.total_outflow)}</span>
-            <span className="text-cyan-400 font-mono tabular-nums">Net: {fmtRs(inspectResult.net_balance)}</span>
+            <span>
+              Mapping proposed by {inspectResult.mapping_source === 'llm' ? 'AI' : 'rules'} (
+              {Math.round(inspectResult.mapping_confidence * 100)}% confidence)
+            </span>
           </div>
 
-          {/* Column Mapping */}
+          {/* Column mapping */}
           <div className="glass-card p-5 space-y-3">
-            <h4 className="text-sm font-bold text-slate-200 flex items-center gap-2">
-              Map Columns
-              <span className="text-[10px] font-normal text-slate-500 font-mono">
-                Assign roles to each column
-              </span>
-            </h4>
+            <h4 className="text-sm font-bold text-slate-200">Map Columns</h4>
+            <p className="text-xs text-slate-500">
+              Use either one signed amount column (optionally with a type column), or separate debit and credit columns.
+            </p>
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
-              {columnMapping.raw_columns.map((col) => (
+              {inspectResult.headers.map((col) => (
                 <div key={col} className="space-y-1">
                   <div className="text-[11px] text-slate-500 truncate font-mono">{col}</div>
                   <div className="relative">
                     <select
-                      value={getColumnRole(col)}
-                      onChange={(e) => handleColumnRoleChange(col, e.target.value)}
+                      value={roleOf(col)}
+                      onChange={(e) => setRole(col, e.target.value as ColumnRole | 'ignore')}
                       className="w-full dark-input text-xs py-2 pr-7 appearance-none cursor-pointer"
                     >
-                      {COLUMN_ROLE_OPTIONS.map((role) => (
-                        <option key={role} value={role} className="bg-[#0F1623]">
-                          {COLUMN_ROLE_LABELS[role]}
-                        </option>
+                      {[...COLUMN_ROLES, 'ignore' as const].map((role) => (
+                        <option key={role} value={role} className="bg-[#0F1623]">{ROLE_LABELS[role]}</option>
                       ))}
                     </select>
                     <ChevronDown className="absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-slate-500 pointer-events-none" />
@@ -265,24 +212,22 @@ export const UploadIngestor: React.FC<UploadIngestorProps> = ({ onCommit, onPres
             </div>
           </div>
 
-          {/* Preview Table */}
+          {/* Preview */}
           <div className="glass-card p-5 space-y-3 overflow-x-auto">
-            <h4 className="text-sm font-bold text-slate-200">5-Row Preview</h4>
+            <h4 className="text-sm font-bold text-slate-200">Preview</h4>
             <table className="w-full text-xs text-left border-collapse">
               <thead>
                 <tr className="border-b border-white/10">
-                  {columnMapping.raw_columns.map((col) => (
+                  {inspectResult.headers.map((col) => (
                     <th key={col} className="pb-2 pr-4 text-slate-500 font-medium whitespace-nowrap">{col}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {columnMapping.preview_rows.map((row, i) => (
-                  <tr key={i} className="border-b border-white/5 hover:bg-white/3">
-                    {columnMapping.raw_columns.map((col) => (
-                      <td key={col} className="py-2 pr-4 text-slate-300 font-mono tabular-nums whitespace-nowrap">
-                        {row[col] ?? '—'}
-                      </td>
+                {inspectResult.preview_rows.map((row, i) => (
+                  <tr key={i} className="border-b border-white/5">
+                    {inspectResult.headers.map((col) => (
+                      <td key={col} className="py-2 pr-4 text-slate-300 font-mono tabular-nums whitespace-nowrap">{row[col] || '—'}</td>
                     ))}
                   </tr>
                 ))}
@@ -290,71 +235,41 @@ export const UploadIngestor: React.FC<UploadIngestorProps> = ({ onCommit, onPres
             </table>
           </div>
 
-          {/* Opening Balance & Floor */}
-          <div className="glass-card p-5 space-y-4">
-            <h4 className="text-sm font-bold text-slate-200">Financial Parameters</h4>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div className="sm:col-span-1 space-y-1">
-                <label className="text-xs text-slate-400 font-medium">Dataset Name</label>
-                <input
-                  type="text"
-                  value={datasetName}
-                  onChange={(e) => setDatasetName(e.target.value)}
-                  className="dark-input w-full"
-                  placeholder="My Financial Data"
-                />
-              </div>
-              <div className="space-y-1">
-                <label className="text-xs text-slate-400 font-medium">Opening Balance (₹)</label>
-                <input
-                  type="text"
-                  value={openingBalance}
-                  onChange={(e) => setOpeningBalance(e.target.value)}
-                  className="dark-input w-full font-mono tabular-nums"
-                  placeholder="e.g. 285000"
-                />
-              </div>
-              <div className="space-y-1">
-                <label className="text-xs text-slate-400 font-medium flex items-center gap-1.5">
-                  <Lock className="w-3 h-3 text-amber-400" />
-                  Emergency Floor (₹)
-                </label>
-                <input
-                  type="text"
-                  value={emergencyFloor}
-                  onChange={(e) => setEmergencyFloor(e.target.value)}
-                  className="dark-input w-full font-mono tabular-nums"
-                  placeholder="e.g. 50000"
-                />
-              </div>
+          {/* Parameters */}
+          <div className="glass-card p-5 grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div className="space-y-1">
+              <label className="text-xs text-slate-400 font-medium">Dataset name</label>
+              <input value={datasetName} onChange={(e) => setDatasetName(e.target.value)} className="dark-input w-full" />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs text-slate-400 font-medium">Opening balance (₹, optional)</label>
+              <input
+                value={openingBalance}
+                onChange={(e) => setOpeningBalance(e.target.value)}
+                className="dark-input w-full font-mono tabular-nums"
+                placeholder="e.g. 285000"
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs text-slate-400 font-medium">Dataset type</label>
+              <select value={datasetType} onChange={(e) => setDatasetType(e.target.value as DatasetType)} className="dark-input w-full">
+                {(Object.keys(DATASET_TYPE_LABELS) as DatasetType[]).map((t) => (
+                  <option key={t} value={t} className="bg-[#0F1623]">{DATASET_TYPE_LABELS[t]}</option>
+                ))}
+              </select>
             </div>
           </div>
 
-          {/* Commit Button */}
-          {committed ? (
-            <div className="flex items-center gap-3 px-5 py-4 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-400">
-              <CheckCircle2 className="w-5 h-5 shrink-0" />
-              <div>
-                <div className="font-semibold text-sm">Baseline (Node 0) built!</div>
-                <div className="text-xs text-emerald-500/80">Switch to "Fork & Compare" tab to explore scenarios.</div>
-              </div>
-            </div>
-          ) : (
-            <button
-              onClick={handleCommit}
-              disabled={isCommitting || !openingBalance || !emergencyFloor}
-              className="w-full py-4 rounded-2xl font-bold text-sm flex items-center justify-center gap-2
-                         bg-gradient-to-r from-emerald-600 to-emerald-500 hover:from-emerald-500 hover:to-emerald-400
-                         text-white shadow-glow transition-all duration-200
-                         disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none"
-            >
-              {isCommitting ? (
-                <><Loader2 className="w-4 h-4 animate-spin" /> Building Baseline…</>
-              ) : (
-                <><CheckCircle2 className="w-4 h-4" /> Build Baseline (Node 0)</>
-              )}
-            </button>
-          )}
+          <button
+            onClick={handleCommit}
+            disabled={isCommitting || !mapping.date_col || !hasAmounts}
+            className="w-full py-4 rounded-2xl font-bold text-sm flex items-center justify-center gap-2
+                       bg-gradient-to-r from-emerald-600 to-emerald-500 hover:from-emerald-500 hover:to-emerald-400
+                       text-white shadow-glow transition-all duration-200
+                       disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none"
+          >
+            {isCommitting ? <><Loader2 className="w-4 h-4 animate-spin" /> Building baseline…</> : <><CheckCircle2 className="w-4 h-4" /> Build Baseline (Node 0)</>}
+          </button>
         </div>
       )}
     </div>

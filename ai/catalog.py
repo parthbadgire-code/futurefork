@@ -8,20 +8,13 @@ Provides:
   - get_financial_catalog_summary() -> str
   - is_financial_decision(text: str) -> bool
   - lookup_decision_schema(name: str) -> dict
-
-Backward-compatible stubs (old timetable catalog):
-  - CATALOG: original timetable dict (preserved as-is)
-  - SUPPORTED_CHANGE_TYPES: list of old change type names
-  - is_supported_change_type(change_type: str) -> bool
-  - get_catalog_summary_text() -> str
 """
 
 from __future__ import annotations
 
-import re
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 # ==============================================================================
 # FINANCIAL CATALOG (NEW)
@@ -161,78 +154,3 @@ def lookup_decision_schema(name: str) -> Dict[str, Any]:
             return v
     raise KeyError(f"Decision schema '{name}' not found in FINANCIAL_CATALOG. "
                    f"Available: {list(FINANCIAL_CATALOG.keys())}")
-
-
-# ==============================================================================
-# BACKWARD COMPATIBILITY STUBS (old timetable catalog)
-# ==============================================================================
-
-CATALOG: Dict[str, Dict[str, Any]] = {
-    "shift_time_window": {
-        "name": "Shift Time Window",
-        "description": "Shifts class sessions between morning (slots 0-3, 09:00-13:00) and afternoon (slots 4-7, 13:00-17:00).",
-        "parameters": {
-            "from": {
-                "type": "string",
-                "enum": ["morning", "afternoon"],
-                "description": "Source time window to move sessions from.",
-                "required": True,
-            },
-            "to": {
-                "type": "string",
-                "enum": ["morning", "afternoon"],
-                "description": "Target time window to move sessions into.",
-                "required": True,
-            },
-            "selection": {
-                "type": "string",
-                "enum": ["all", "electives", "labs", "lowest_enrollment_n", "explicit_ids"],
-                "description": "Filter criteria for which classes in the source window are shifted.",
-                "required": True,
-            },
-        },
-        "examples": [
-            {"from": "afternoon", "to": "morning", "selection": "all"},
-        ],
-    },
-    "room_change": {
-        "name": "Room Inventory Change",
-        "description": "Removes unavailable/closed rooms or adds reserve venue capacity to the timetable inventory.",
-        "parameters": {
-            "action": {
-                "type": "string",
-                "enum": ["remove", "add"],
-                "required": True,
-            },
-        },
-        "examples": [{"action": "remove", "room_ids": ["R101"]}],
-    },
-    "faculty_load_cap": {
-        "name": "Faculty Teaching Load Cap",
-        "description": "Sets a maximum upper threshold on weekly teaching hours across faculty members.",
-        "parameters": {
-            "max_hours_per_week": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 40,
-                "required": True,
-            },
-        },
-        "examples": [{"max_hours_per_week": 18}],
-    },
-}
-
-SUPPORTED_CHANGE_TYPES: List[str] = list(CATALOG.keys())
-
-
-def is_supported_change_type(change_type: str) -> bool:
-    """Backward-compatible: returns True if change_type is in the old timetable catalog."""
-    return change_type in CATALOG
-
-
-def get_catalog_summary_text() -> str:
-    """Backward-compatible: returns the old timetable catalog summary."""
-    lines = ["Supported Change Types in FutureFork MVP:"]
-    for k, v in CATALOG.items():
-        lines.append(f"- {k}: {v['description']}")
-    return "\n".join(lines)

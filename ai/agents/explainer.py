@@ -11,7 +11,6 @@ Public API:
   fmt_inr_lakh(amount: float) -> str
 
 Backward compat:
-  explain(decision_spec, results) -> dict  (old timetable stub)
 """
 
 from __future__ import annotations
@@ -617,9 +616,11 @@ def _llm_explain(
         return None, 0
 
     try:
-        from pydantic import BaseModel
-        from ai.llm import call_structured_llm
         import json as _json
+
+        from pydantic import BaseModel
+
+        from ai.llm import call_structured_llm
 
         class _ExplainSchema(BaseModel):
             explanation: str
@@ -761,26 +762,3 @@ def explain_branches(
         guard_report=report,
         retry_count=retry_count,
     )
-
-
-# ===========================================================================
-# Backward compatibility stub (old timetable explainer)
-# ===========================================================================
-
-
-def explain(decision_spec: Dict[str, Any], results: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    DEPRECATED stub kept for backward compatibility with old timetable routes.
-    """
-    import warnings
-    warnings.warn(
-        "explain() is deprecated. Use explain_branches() instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return {
-        "summary": "FutureFork financial analysis completed.",
-        "tradeoffs": {k: f"Scenario {k}: see branch results." for k in results},
-        "recommendation": "See explain_branches() for financial decision analysis.",
-        "model_generated": False,
-    }

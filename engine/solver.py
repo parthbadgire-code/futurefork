@@ -13,27 +13,21 @@ Formulates exact CP-SAT integer programming constraints for 12-month cash flows:
    - EMI / Lease Financing (6 or 12 monthly installments with annual financing rate)
    - Phased Split (Milestone delay e.g. 50/50 without debt/interest)
    - Trim & Buy (Discretionary category trimming to safeguard emergency reserve)
-4. Retains backward compatibility for timetable scheduling evaluation.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
 from ortools.sat.python import cp_model
 
-from engine.changes import (
-    apply_change,
-)
 from engine.metrics import (
     compute_financial_metrics,
 )
 from engine.model import (
-    Assignment,
     FinancialProblemInstance,
     MonthlyCashSchedule,
-    ProblemInstance,
     PurchaseGoal,
     ScenarioEvaluationResult,
 )
@@ -863,17 +857,8 @@ def solve_all_financial_scenarios(
     all_branches = [res_baseline, res_upfront, res_emi, res_phased, res_trim]
 
     if run_monte_carlo:
-        from engine.simulator import run_financial_monte_carlo
         for r in all_branches:
-            sim = run_financial_monte_carlo(r, instance, n_runs=n_sims, seed=seed)
-            r.simulation_results = sim
-            r.metrics["cash_out_risk_pct"] = sim["cash_out_risk_pct"]
-            r.metrics["floor_breach_risk_pct"] = sim["floor_breach_risk_pct"]
-            r.metrics["p10_lowest_balance"] = sim["p10_lowest_balance"]
-            r.metrics["p50_lowest_balance"] = sim["p50_lowest_balance"]
-            r.metrics["p90_lowest_balance"] = sim["p90_lowest_balance"]
-            r.metrics["survival_score_pct"] = sim["survival_score_pct"]
-            r.metrics["simulation_runtime_ms"] = sim["runtime_ms"]
+            attach_simulation(r, instance, n_sims=n_sims, seed=seed)
 
     total_time = time.perf_counter() - start_all
     for r in all_branches:
@@ -888,258 +873,60 @@ def solve_all_financial_scenarios(
     }
 
 
-# ==============================================================================
-# TIMETABLE BACKWARD COMPATIBLE EVALUATORS
-# ==============================================================================
-
-def evaluate_baseline(
-    dataset: Any,
-    baseline_timetable: Optional[List[Dict[str, Any]]] = None,
+def attach_simulation(
+    result: ScenarioEvaluationResult,
+    instance: FinancialProblemInstance,
     n_sims: int = 300,
     seed: int = 42,
-) -> Any:
-    """
-    Evaluates baseline timetable directly without re-solving.
-    If financial instance passed, routes to evaluate_financial_baseline.
-    """
-    if isinstance(dataset, FinancialProblemInstance) or (
-        isinstance(dataset, dict) and "outflows" in dataset and "inflows" in dataset
+) -> ScenarioEvaluationResult:
+    """Runs the Monte Carlo simulator on a solved branch and merges its risk metrics in place."""
+    from engine.simulator import run_financial_monte_carlo
+
+    sim = run_financial_monte_carlo(result, instance, n_runs=n_sims, seed=seed)
+    result.simulation_results = sim
+    for key in (
+        "cash_out_risk_pct",
+        "floor_breach_risk_pct",
+        "p10_lowest_balance",
+        "p50_lowest_balance",
+        "p90_lowest_balance",
+        "survival_score_pct",
     ):
-        inst = (
-            dataset
-            if isinstance(dataset, FinancialProblemInstance)
-            else FinancialProblemInstance.from_dict(dataset)
-        )
-        return evaluate_financial_baseline(inst)
-
-    from engine.metrics import evaluate
-    from engine.simulator import run_simulation
-
-    tb = baseline_timetable or []
-    metrics = evaluate(tb, dataset)
-    sim = run_simulation(tb, dataset, n_runs=n_sims, seed=seed)
-
-    return {
-        "scenario_id": "baseline",
-        "solver": {
-            "status": "FEASIBLE",
-            "objective": 145.0,
-            "runtime_s": 0.05,
-        },
-        "metrics": metrics,
-        "simulation": sim,
-        "timetable": tb,
-        "explanation": "Baseline timetable reflects current operation with 8 student clashes and 3 faculty double-bookings.",
-    }
+        result.metrics[key] = sim[key]
+    result.metrics["worst_case_lowest_balance"] = sim["p10_lowest_balance"]
+    result.metrics["simulation_runtime_ms"] = sim["runtime_ms"]
+    return result
 
 
-def solve_scenario(
-    dataset: ProblemInstance,
-    change: Dict[str, Any],
-    time_limit_seconds: float = 8.0,
-    seed: int = 42,
-    num_workers: int = 4,
-) -> Dict[str, Any]:
-    """Applies change and runs OR-Tools CP-SAT to produce an optimized timetable."""
-    start_time = time.time()
-
-    mod = apply_change(dataset, change)
-    rooms = mod["rooms"]
-    faculty = mod["faculty"]
-    events = mod["events"]
-    allowed_slots_per_event = mod["allowed_slots_per_event"]
-    target_events = mod.get("target_events", set())
-
-    rooms_by_id = {r.room_id: r for r in rooms}
-    faculty_by_id = {f.faculty_id: f for f in faculty}
-    baseline_by_event = {a.event_id: a for a in dataset.baseline_assignments}
-
-    model = cp_model.CpModel()
-    x = {}
-    event_vars = {e.event_id: [] for e in events}
-    unplaced_vars = {}
-
-    days = list(range(5))
-    slots = list(range(8))
-
-    for ev in events:
-        base = baseline_by_event.get(ev.event_id)
-        if target_events and ev.event_id not in target_events and base:
-            allowed_days = [base.day]
-            allowed_slots = [base.slot]
-        else:
-            allowed_days = days
-            allowed_slots = allowed_slots_per_event.get(ev.event_id, slots)
-
-        for d in allowed_days:
-            for s in allowed_slots:
-                for r in rooms:
-                    if ev.is_lab and not r.is_lab:
-                        continue
-                    if r.capacity < ev.expected_enrollment * 0.8:
-                        continue
-
-                    var_name = f"x_{ev.event_id}_d{d}_s{s}_{r.room_id}"
-                    v = model.NewBoolVar(var_name)
-                    x[(ev.event_id, d, s, r.room_id)] = v
-                    event_vars[ev.event_id].append(v)
-
-        unplaced_v = model.NewBoolVar(f"unplaced_{ev.event_id}")
-        unplaced_vars[ev.event_id] = unplaced_v
-        model.Add(sum(event_vars[ev.event_id]) + unplaced_v == 1)
-
-    # Room capacity constraints
-    for d in days:
-        for s in slots:
-            for r in rooms:
-                placed_in_room = [
-                    x[(ev.event_id, d, s, r.room_id)]
-                    for ev in events
-                    if (ev.event_id, d, s, r.room_id) in x
-                ]
-                if placed_in_room:
-                    model.Add(sum(placed_in_room) <= 1)
-
-    # Faculty conflicts
-    fac_clash_vars = []
-    for d in days:
-        for s in slots:
-            for f in faculty:
-                placed_for_fac = [
-                    x[(ev.event_id, d, s, r.room_id)]
-                    for ev in events
-                    if ev.faculty_id == f.faculty_id
-                    for r in rooms
-                    if (ev.event_id, d, s, r.room_id) in x
-                ]
-                if len(placed_for_fac) > 1:
-                    c_var = model.NewBoolVar(f"fac_clash_f{f.faculty_id}_d{d}_s{s}")
-                    fac_clash_vars.append(c_var)
-                    model.Add(sum(placed_for_fac) <= 1 + c_var * 4)
-
-    # Objective
-    penalties = []
-    for u in unplaced_vars.values():
-        penalties.append(u * 10000)
-    for c in fac_clash_vars:
-        penalties.append(c * 50)
-
-    model.Minimize(sum(penalties))
-
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = time_limit_seconds
-    solver.parameters.num_search_workers = num_workers
-    solver_status_code = solver.Solve(model)
-
-    status_str = "OPTIMAL" if solver_status_code == cp_model.OPTIMAL else "FEASIBLE"
-    runtime = round(time.time() - start_time, 3)
-
-    solved_assignments: List[Assignment] = []
-    unplaced_count = 0
-    for ev in events:
-        placed = False
-        for (eid, d, s, rid), v in x.items():
-            if eid == ev.event_id and solver.Value(v) == 1:
-                r_obj = rooms_by_id[rid]
-                f_obj = faculty_by_id.get(ev.faculty_id)
-                solved_assignments.append(
-                    Assignment(
-                        event_id=ev.event_id,
-                        course=ev.course_name,
-                        faculty=f_obj.name if f_obj else ev.faculty_id,
-                        faculty_id=ev.faculty_id,
-                        group=ev.group_id,
-                        group_id=ev.group_id,
-                        room=r_obj.name,
-                        room_id=rid,
-                        day=d,
-                        slot=s,
-                        clash=False,
-                    )
-                )
-                placed = True
-                break
-        if not placed:
-            unplaced_count += 1
-            solved_assignments.append(
-                Assignment(
-                    event_id=ev.event_id,
-                    course=ev.course_name,
-                    faculty=ev.faculty_id,
-                    faculty_id=ev.faculty_id,
-                    group=ev.group_id,
-                    group_id=ev.group_id,
-                    room="UNASSIGNED",
-                    room_id="NONE",
-                    day=0,
-                    slot=0,
-                    clash=True,
-                    clash_reasons=["Unplaced/overflow in solver"],
-                )
-            )
-
-    from engine.metrics import evaluate
-    metrics = evaluate(solved_assignments, dataset)
-    objective_val = (
-        round(solver.ObjectiveValue(), 1)
-        if solver_status_code in (cp_model.OPTIMAL, cp_model.FEASIBLE)
-        else 999.0
-    )
-
-    return {
-        "status": status_str,
-        "objective": objective_val,
-        "runtime_s": runtime,
-        "timetable": [a.to_dict() for a in solved_assignments],
-        "metrics": metrics,
-        "unplaced_count": unplaced_count,
-    }
-
-
-def evaluate_scenario(
-    dataset: Any,
-    baseline_timetable: Optional[List[Dict[str, Any]]] = None,
-    change: Optional[Dict[str, Any]] = None,
+def evaluate_financial_branch(
+    instance: FinancialProblemInstance,
+    branch_type: str,
+    goal: Union[PurchaseGoal, Dict[str, Any]],
     n_sims: int = 300,
     seed: int = 42,
-) -> Dict[str, Any]:
+) -> ScenarioEvaluationResult:
     """
-    Public entry point for scenario evaluation.
-    Routes to financial solver if dataset is FinancialProblemInstance.
-    """
-    if isinstance(dataset, FinancialProblemInstance) or (
-        isinstance(dataset, dict) and "outflows" in dataset and "inflows" in dataset
-    ):
-        inst = (
-            dataset
-            if isinstance(dataset, FinancialProblemInstance)
-            else FinancialProblemInstance.from_dict(dataset)
-        )
-        ch = change or {}
-        goal = PurchaseGoal.from_dict(ch.get("params", ch))
-        res = solve_financial_scenario(inst, goal, branch_type=ch.get("type", "auto"))
-        return res.to_dict()
+    Single public entry point used by the backend: evaluates ONE branch end to end.
 
-    from engine.simulator import run_simulation
-    if isinstance(dataset, dict):
-        instance = ProblemInstance.from_dict(dataset)
-    elif isinstance(dataset, ProblemInstance):
-        instance = dataset
+    - branch_type "baseline": Node 0 status quo (no purchase) against goal.emergency_floor.
+    - any fork type ("upfront" | "emi" | "phased" | "trim"): applies the fork transformer to
+      the goal, solves it with CP-SAT, then runs the Monte Carlo stress test.
+
+    Raises on invalid input instead of returning placeholder numbers.
+    """
+    from engine.changes import apply_financial_change, normalize_branch_type
+
+    g = goal if isinstance(goal, PurchaseGoal) else PurchaseGoal.from_dict(goal)
+    b_type = (branch_type or "").lower()
+    if b_type != "baseline":
+        b_type = normalize_branch_type(b_type)
+
+    if b_type == "baseline":
+        result = evaluate_financial_baseline(instance, g.emergency_floor)
     else:
-        raise ValueError("Invalid dataset format passed to evaluate_scenario")
+        if g.total_cost <= 0:
+            raise ValueError("Purchase goal total_cost must be > 0 to evaluate a fork")
+        fork_goal = apply_financial_change(instance, {"type": b_type, "params": g.to_dict()}, g)
+        result = solve_financial_scenario(instance, fork_goal, branch_type=b_type)
 
-    solve_res = solve_scenario(instance, change or {}, time_limit_seconds=8.0, seed=seed)
-    sim_res = run_simulation(solve_res["timetable"], dataset, n_runs=n_sims, seed=seed)
-
-    return {
-        "scenario_id": (change or {}).get("id", "scenario"),
-        "solver": {
-            "status": solve_res["status"],
-            "objective": solve_res["objective"],
-            "runtime_s": solve_res["runtime_s"],
-        },
-        "metrics": solve_res["metrics"],
-        "simulation": sim_res,
-        "timetable": solve_res["timetable"],
-        "explanation": None,
-    }
+    return attach_simulation(result, instance, n_sims=n_sims, seed=seed)

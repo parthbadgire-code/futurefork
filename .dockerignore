@@ -6,9 +6,16 @@ __pycache__
 env/
 venv/
 .venv/
+.pytest_cache/
+.ruff_cache/
 frontend/node_modules/
 frontend/dist/
 .git
 .github
 .vscode
-futurefork.db
+scratch/
+docs/
+# Never bake secrets or local databases into an image
+.env
+frontend/.env
+*.db

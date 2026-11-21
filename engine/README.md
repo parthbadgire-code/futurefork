@@ -1,99 +1,91 @@
 # FutureFork Optimization & Simulation Engine
 
-**Team FutureLabs | Elite Coders CodeSprint 2026 | Person C**
+> **The Golden Rule**: AI agents interpret and explain. Mathematical models calculate and validate. The LLM never produces a number that ends up on screen. Every number comes from the solver, the metric engine or the simulator.
 
-> **The Golden Rule**: AI agents interpret and explain. Mathematical models calculate and validate. The LLM never produces a number that ends up on screen. Every number comes from the solver or the simulator.
-
-The engine is a pure Python package with zero dependencies on HTTP, databases, or LLMs. Given dataset inputs and a policy change specification, it applies mathematical modifications, solves for the optimal timetable using Google OR-Tools CP-SAT, computes four domain metrics, and performs a 300-run vectorized Monte Carlo simulation using NumPy.
+The engine is a pure Python package with no dependencies on HTTP, databases or LLMs. Given a 12-month cash-flow baseline and a purchase goal, it applies one of four fork strategies, solves for the best schedule with Google OR-Tools CP-SAT, computes deterministic risk metrics, and stress-tests the result with a 300-run vectorized NumPy Monte Carlo simulation.
 
 ---
 
-## 1. Domain Model
+## 1. Domain Model ([`model.py`](model.py))
 
-- **Time Grid**: 5 days (Monday to Friday) $\times$ 8 hourly slots (09:00 to 17:00).
-  - *Morning*: Slots 0 to 3 (09:00 - 13:00).
-  - *Afternoon*: Slots 4 to 7 (13:00 - 17:00).
-- **Entities**:
-  - `Event`: One weekly session of a course (faculty, student group, duration in slots, type: `lecture` | `lab` | `elective`, enrollment).
-  - `Room`: Physical venue with seating capacity and type (`lecture` | `lab`).
-  - `Faculty`: Teaching staff member with maximum teaching hours cap.
-  - `StudentGroup`: Student cohort (e.g. CS-Year1, CS-Year2).
-  - `Assignment`: An allocated `(event, day, slot, room)` mapping.
+| Type | What it holds |
+|---|---|
+| `FinancialProblemInstance` | Node 0 baseline: 12 months × 8 categories of outflows, 12 monthly inflows, starting balance, each category's fixed/flexible tag and its historical mean and standard deviation |
+| `PurchaseGoal` | The decision: total cost, emergency floor, target month, financing mode, EMI months, interest rate, phased splits, maximum trim % and flexible categories |
+| `MonthlyCashSchedule` | One month of a solved plan: inflow, base and trimmed outflow, purchase cash-out, closing balance, floor breach |
+| `ScenarioEvaluationResult` | One evaluated branch: 12 schedules, category trims, metrics, solver metadata and Monte Carlo results |
 
----
-
-## 2. Exact Metric Definitions
-
-All metrics are computed strictly in [`engine/metrics.py`](metrics.py):
-
-1. **Student Clashes** (*Direction: Minimize*):
-   For each student cohort $g$ and each time slot $(d, s)$, if the group has $k > 1$ events scheduled concurrently:
-   $$\text{Student Clashes} = \sum_{g, d, s} \max(0, k_{g, d, s} - 1)$$
-
-2. **Faculty Clashes** (*Direction: Minimize*):
-   For each faculty member $f$ and each time slot $(d, s)$, if the instructor has $k > 1$ events scheduled concurrently:
-   $$\text{Faculty Clashes} = \sum_{f, d, s} \max(0, k_{f, d, s} - 1)$$
-
-3. **Room Utilization** (*Direction: Maximize*):
-   Occupied room-hours divided by active operational room capacity, expressed as a percentage:
-   $$\text{Room Utilization} = \left( \frac{\text{Occupied Room-Slots}}{\text{Available Room Capacity}} \right) \times 100\%$$
-
-4. **Average Student Gaps** (*Direction: Minimize*):
-   For each student cohort and day, count empty slots between that day's first and last class. Average over all group-days with classes, reported in hours:
-   $$\text{Avg Gaps} = \frac{1}{|GD|} \sum_{(g, d) \in GD} (\text{Last Slot} - \text{First Slot} + 1 - \text{Classes Count})$$
+The baseline is compiled from CSV by [`data/ingestor.py`](../data/ingestor.py). Categories are consolidated to exactly 8 (the top 7 by spend plus "Other / Discretionary") and tagged `fixed` (salaries, rent, utilities, ...) or `flexible`.
 
 ---
 
-## 3. Mathematical Optimization Formulation (OR-Tools CP-SAT)
+## 2. Cash-Flow Model
 
-The solver is implemented in [`engine/solver.py`](solver.py).
+For every branch the solver enforces the monthly balance recursion
 
-### Decision Variables
-- $x_{e, d, s, r} \in \{0, 1\}$: Binary variable indicating whether event $e$ is assigned to day $d$, slot $s$, and room $r$.
-- $u_e \in \{0, 1\}$: Slack variable indicating an unplaced event (heavily penalized with cost $10,000$).
+$$B_t = B_{t-1} + \text{Inflow}_t - \text{Outflow}_t - \text{Purchase}_t + \text{Trim}_t, \qquad B_{-1} = B_0$$
 
-### Hard Operational Constraints
-1. **Single Placement**: Every event must either be scheduled into exactly one valid room-slot or marked unplaced:
-   $$\sum_{d, s, r} x_{e, d, s, r} + u_e = 1 \quad \forall e \in E$$
-2. **Room Exclusivity**: A room hosts at most one event in any given slot:
-   $$\sum_{e} x_{e, d, s, r} \le 1 \quad \forall r, d, s$$
-3. **Room Compatibility**: Events requiring laboratories ($e.\text{is\_lab}$) cannot be placed in standard lecture halls.
-4. **Capacity Threshold**: A room must provide at least 80% seating for the expected enrollment.
-
-### Soft Constraints & Penalties
-To prevent radical policy decisions (such as cramming 100% of afternoon classes into the morning) from crashing the engine with an `INFEASIBLE` error, clashes are modeled as soft constraints with high penalties:
-- **Faculty Double-Booking Penalty**: Weight $20$ per clash.
-- **Student Cohort Overlap Penalty**: Weight $10$ per clash.
-- **Schedule Spacing / Gaps Penalty**: Weight $1$ per slot index.
-
-### Objective Function
-$$\min \sum \left( 20 \times \text{FacultyClash} + 10 \times \text{StudentClash} + 1 \times \text{GapPenalty} + 10000 \times u_e \right)$$
-
-### Warm-Starting (AddHint)
-The solver injects the baseline timetable into the CP-SAT model using `model.AddHint()`, drastically accelerating convergence to under 1 second.
+and a deficit variable $D_t \ge F - B_t$, $D_t \ge 0$ against the emergency floor $F$. Each fork minimizes total floor deficit first and a fork-specific secondary term second. The floor is a soft constraint, so the solver always returns the least-bad plan instead of `INFEASIBLE`.
 
 ---
 
-## 4. Vectorized Monte Carlo Simulation
+## 3. The Four Forks ([`changes.py`](changes.py), [`solver.py`](solver.py))
 
-Implemented in [`engine/simulator.py`](simulator.py) using NumPy across 300 iterations:
+| Fork | Transformer | CP-SAT decision | Secondary objective |
+|---|---|---|---|
+| **Upfront** | `apply_upfront` | Purchase month $p$ (one-hot over 12 months) | Smallest delay from the target month |
+| **EMI** | `apply_emi_split` | Instalment start month for an $N$-month plan with annual interest and optional down payment | Stay close to the target month |
+| **Phased** | `apply_phased_delay` | Month of the second tranche (default 50/50 split, no interest) | Prefer an earlier second phase |
+| **Trim** | `apply_discretionary_trim` | Cut $z_c \in [0, \text{max\_trim}]$ per flexible category (default up to 35%); fixed categories are never cut | Minimum weighted "pain" of cuts |
 
-1. **Session Overruns**: Each class has a $10\%$ probability of overrunning into the subsequent slot, modeling real-world lecture drift.
-2. **Room Outages**: Each room has a $2\%$ chance of experiencing an HVAC, projector, or maintenance outage, forcing sudden room swaps.
-3. **Elective Enrollment Variations**: Perturbs attendance rosters to simulate fluctuating student section choices.
+`normalize_branch_type` maps aliases (`phased_delay`, `discretionary_trim`, `lease`, ...) to the four canonical types and rejects anything else.
 
-Outputs per metric: $\text{Mean}$, $\text{Std}$, $\text{P10}$, $\text{P90}$, and $\text{Prob(Zero Clashes)}$.
+**Known limitation:** Trim & Buy always buys in the target month, while Upfront may move the purchase to the safest month. Trim can therefore end with a lower minimum balance than Upfront.
 
 ---
 
-## 5. Public API
+## 4. Metrics ([`metrics.py`](metrics.py))
+
+| Metric | Definition |
+|---|---|
+| `lowest_balance`, `lowest_balance_month` | Minimum closing balance over the 12 months and when it occurs |
+| `months_below_floor` | Months whose closing balance is below the emergency floor |
+| `runway_months` | Ending balance ÷ average monthly outflow |
+| `total_purchase_cost`, `total_financing_interest`, `total_trims_saved` | Cost breakdown of the plan |
+| `cash_out_risk_pct` | Share of Monte Carlo runs whose balance goes below ₹0 |
+| `floor_breach_risk_pct` | Share of runs that breach the emergency floor |
+| `p10_lowest_balance` (`p10_worst_balance` in the API) | 10th-percentile lowest balance across runs |
+| `survival_score_pct` | Composite 5–100 score: 100 when no run breaches the floor or goes below ₹0, reduced by breach risk, cash-out risk and deficit depth |
+
+---
+
+## 5. Monte Carlo Simulation ([`simulator.py`](simulator.py))
+
+Each solved schedule is replayed 300 times (vectorized `(runs, 12, categories)` arrays, seeded for reproducibility) with three shocks:
+
+1. **Inflow delay**: about 20% of runs have 40–85% of one month's inflow slip to the next month.
+2. **Emergency outflow**: each month has a 5% chance of an unexpected expense sized from the dataset's typical outflow.
+3. **Category drift**: flexible categories get Gaussian spend multipliers based on their historical coefficient of variation (clipped to 0.70–1.45).
+
+The simulator returns the risk metrics above plus a monthly P10/P50/P90 balance band for the UI's confidence ribbon.
+
+---
+
+## 6. Public API
 
 ```python
-from engine.solver import evaluate_scenario, evaluate_baseline
+from data.loader import load_sample_instance
+from engine.model import PurchaseGoal
+from engine.solver import evaluate_financial_branch, solve_all_financial_scenarios
 
-# 1. Baseline path (measures and simulates existing timetable without solving)
-baseline_result = evaluate_baseline(dataset, baseline_timetable, n_sims=300, seed=42)
+instance = load_sample_instance("personal_upi.csv")
+goal = PurchaseGoal(item_name="Laptop", total_cost=120_000, emergency_floor=30_000)
 
-# 2. Scenario path (applies change, solves with CP-SAT, evaluates metrics and runs MC)
-scenario_result = evaluate_scenario(dataset, baseline_timetable, change_spec, n_sims=300, seed=42)
+# One branch end to end: transformer -> CP-SAT -> Monte Carlo (used by the backend)
+emi = evaluate_financial_branch(instance, "emi", goal, n_sims=300, seed=42)
+
+# Baseline + all four forks in one call
+results = solve_all_financial_scenarios(instance, goal)
 ```
+
+`evaluate_financial_branch` raises on invalid input (unknown fork type, zero cost) rather than returning placeholder numbers.

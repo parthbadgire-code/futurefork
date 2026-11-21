@@ -232,6 +232,10 @@ def parse_date_series(series: pd.Series, date_format: Optional[str] = None) -> p
         except Exception:
             pass
 
+    # Normalise DD-MM-YYYY / DD.MM.YYYY to DD/MM/YYYY. pandas infers ONE format from the first
+    # value, so a column mixing "28/04/2024" and "18-07-2024" would otherwise silently drop rows.
+    s = s.str.replace(r"^(\d{1,2})[-.](\d{1,2})[-.](\d{2,4})$", r"\1/\2/\3", regex=True)
+
     # Try dayfirst=True first (predominant standard in India: DD/MM/YYYY or DD-MM-YYYY)
     parsed = pd.to_datetime(s, dayfirst=True, errors="coerce")
     # If more than 35% failed to parse, attempt standard ISO / dayfirst=False
@@ -731,7 +735,6 @@ if __name__ == "__main__":
 
     data_dir = Path(__file__).resolve().parent
     samples_dir = data_dir / "samples"
-    legacy_dir = data_dir / "sample"
 
     # CSV sample test targets
     test_csvs = [
@@ -749,10 +752,7 @@ if __name__ == "__main__":
     all_passed = True
 
     for filename, display_name, explicit_map in test_csvs:
-        # Check samples/ or sample/
         p = samples_dir / filename
-        if not p.exists():
-            p = legacy_dir / filename
 
         if not p.exists():
             print(f"[WARN] {filename} not found, generating sample datasets first...")

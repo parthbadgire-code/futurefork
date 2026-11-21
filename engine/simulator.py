@@ -13,7 +13,6 @@ Executes a vectorized (300, 12) simulation matrix over 12-month CP-SAT schedules
 4. Generates rich risk distributions: Cash-Out Risk (%), p10 Worst-Case Lowest Balance,
    Lowest Balance Month, Runway (Months), Survival Score (%), and confidence fan charts.
 5. Benchmark Target: < 50ms per branch.
-6. Retains backward compatibility for timetable scheduling simulations.
 """
 
 from __future__ import annotations
@@ -23,12 +22,9 @@ from typing import Any, Dict, List, Union
 
 import numpy as np
 
-from engine.metrics import evaluate
 from engine.model import (
-    Assignment,
     FinancialProblemInstance,
     MonthlyCashSchedule,
-    ProblemInstance,
     ScenarioEvaluationResult,
 )
 
@@ -277,103 +273,4 @@ def run_financial_monte_carlo(
             "lowest_balance": {"mean": round(mean_lowest, 1), "p10": round(p10_lowest, 1), "p90": round(p90_lowest, 1)},
             "survival_score": {"mean": survival_score, "p10": survival_score, "p90": survival_score},
         },
-    }
-
-
-# ==============================================================================
-# TIMETABLE MONTE CARLO SIMULATOR (BACKWARD COMPATIBILITY)
-# ==============================================================================
-
-def run_simulation(
-    timetable: Union[List[Union[Assignment, Dict[str, Any]]], ScenarioEvaluationResult],
-    dataset: Union[ProblemInstance, FinancialProblemInstance, Dict[str, Any]],
-    n_runs: int = 300,
-    seed: int = 42,
-) -> Dict[str, Any]:
-    """
-    Unified simulation entry point:
-    - If dataset is FinancialProblemInstance, delegates to run_financial_monte_carlo.
-    - Otherwise runs academic timetable perturbation Monte Carlo.
-    """
-    if isinstance(dataset, FinancialProblemInstance):
-        return run_financial_monte_carlo(timetable, dataset, n_runs=n_runs, seed=seed)
-
-    rng = np.random.default_rng(seed)
-
-    # Normalize assignments to list of dicts
-    assignments = []
-    if isinstance(timetable, ScenarioEvaluationResult):
-        return {}
-    for a in timetable:
-        if isinstance(a, Assignment):
-            assignments.append(a.to_dict())
-        elif isinstance(a, dict):
-            assignments.append(a)
-
-    n_events = len(assignments)
-    if n_events == 0:
-        empty_dist = {"mean": 0.0, "std": 0.0, "p10": 0.0, "p90": 0.0}
-        return {
-            "n_runs": n_runs,
-            "per_metric": {
-                "student_clashes": empty_dist,
-                "faculty_clashes": empty_dist,
-                "room_utilization": empty_dist,
-                "avg_student_gaps": empty_dist,
-            },
-            "prob_zero_clashes": 1.0,
-        }
-
-    # Deterministic baseline metric values
-    base_metrics = evaluate(assignments, dataset)
-    base_student_clashes = base_metrics["student_clashes"]
-    base_fac_clashes = base_metrics["faculty_clashes"]
-    base_util = base_metrics["room_utilization"]
-    base_gaps = base_metrics["avg_student_gaps"]
-
-    # --- Perturbation 1: Class Overruns ---
-    overrun_probs = rng.random((n_runs, n_events)) < 0.10
-    overrun_slots = np.array([a["slot"] for a in assignments])
-    valid_overrun_mask = (overrun_slots < 7)
-    active_overruns = overrun_probs & valid_overrun_mask[np.newaxis, :]
-    overrun_counts = np.sum(active_overruns, axis=1)
-
-    simulated_fac_clashes = base_fac_clashes + rng.binomial(overrun_counts, 0.25)
-    simulated_stu_clashes = base_student_clashes + rng.binomial(overrun_counts, 0.35)
-
-    # --- Perturbation 2: Room Outages ---
-    room_outage_probs = rng.random((n_runs, n_events)) < 0.02
-    room_outage_counts = np.sum(room_outage_probs, axis=1)
-    simulated_stu_clashes += rng.binomial(room_outage_counts, 0.40)
-
-    # --- Perturbation 3: Elective Enrollment Resampling ---
-    enrollment_perturbation = rng.normal(0.0, 0.5, size=n_runs)
-    simulated_stu_clashes = np.maximum(0, np.round(simulated_stu_clashes + enrollment_perturbation)).astype(int)
-
-    util_drift = rng.normal(0.0, 1.2, size=n_runs)
-    simulated_util = np.clip(base_util + util_drift, 10.0, 100.0)
-
-    gap_drift = rng.normal(0.0, 0.08, size=n_runs)
-    simulated_gaps = np.maximum(0.1, base_gaps + gap_drift)
-
-    zero_clashes_mask = (simulated_stu_clashes == 0) & (simulated_fac_clashes == 0)
-    prob_zero_clashes = round(float(np.mean(zero_clashes_mask)), 2)
-
-    def calc_dist(arr: np.ndarray) -> Dict[str, float]:
-        return {
-            "mean": round(float(np.mean(arr)), 1),
-            "std": round(float(np.std(arr)), 1),
-            "p10": round(float(np.percentile(arr, 10)), 1),
-            "p90": round(float(np.percentile(arr, 90)), 1),
-        }
-
-    return {
-        "n_runs": n_runs,
-        "per_metric": {
-            "student_clashes": calc_dist(simulated_stu_clashes),
-            "faculty_clashes": calc_dist(simulated_fac_clashes),
-            "room_utilization": calc_dist(simulated_util),
-            "avg_student_gaps": calc_dist(simulated_gaps),
-        },
-        "prob_zero_clashes": prob_zero_clashes,
     }

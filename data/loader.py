@@ -6,7 +6,7 @@ Provides clean, typed helper functions for the rest of the team:
 - load_sample_csv_bytes(name: str) -> bytes
 - load_sample_instance(name: str) -> FinancialProblemInstance
 - load_fixture_json(path: str) -> dict
-- Backward-compatible DatasetLoader & default_loader for legacy timetable bundle
+- list_sample_datasets() -> list of bundled sample CSV names
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ from data.ingestor import (
 
 DATA_DIR = Path(__file__).resolve().parent
 SAMPLES_DIR = DATA_DIR / "samples"
-LEGACY_SAMPLE_DIR = DATA_DIR / "sample"
 
 
 # ==============================================================================
@@ -37,7 +36,7 @@ LEGACY_SAMPLE_DIR = DATA_DIR / "sample"
 # ==============================================================================
 
 def _resolve_sample_path(name: Union[str, Path], default_ext: str = ".csv") -> Path:
-    """Helper to resolve sample file from name in samples/ or sample/ directory."""
+    """Helper to resolve a sample file by name from data/samples/ or the repo root."""
     p_name = Path(name)
     clean_name = str(name).strip()
     base_name = p_name.name
@@ -63,7 +62,7 @@ def _resolve_sample_path(name: Union[str, Path], default_ext: str = ".csv") -> P
 
     # Priority search locations
     for c_name in deduped:
-        for parent in [Path("."), ROOT_DIR, SAMPLES_DIR, LEGACY_SAMPLE_DIR, DATA_DIR]:
+        for parent in [Path("."), ROOT_DIR, SAMPLES_DIR, DATA_DIR]:
             p = (parent / c_name).resolve()
             if p.is_file():
                 return p
@@ -71,7 +70,6 @@ def _resolve_sample_path(name: Union[str, Path], default_ext: str = ".csv") -> P
     raise FileNotFoundError(
         f"Financial sample file '{name}' not found. Searched for candidates {deduped} in:\n"
         f" - {SAMPLES_DIR}\n"
-        f" - {LEGACY_SAMPLE_DIR}\n"
         f" - {ROOT_DIR}"
     )
 
@@ -161,68 +159,7 @@ def load_fixture_json(path_or_name: Union[str, Path] = "fixture_institute_node0.
 def list_sample_datasets() -> List[str]:
     """Returns list of all available financial sample CSV names."""
     samples = set()
-    for d in [SAMPLES_DIR, LEGACY_SAMPLE_DIR]:
-        if d.exists():
-            for p in d.glob("*.csv"):
-                samples.add(p.name)
+    if SAMPLES_DIR.exists():
+        for p in SAMPLES_DIR.glob("*.csv"):
+            samples.add(p.name)
     return sorted(list(samples))
-
-
-# ==============================================================================
-# BACKWARD COMPATIBILITY: LEGACY TIMETABLE LOADER
-# ==============================================================================
-
-class DatasetLoader:
-    """
-    Legacy University Timetable Loader kept strictly backward-compatible
-    for existing tests and routes until fully transitioned to Finance engine.
-    """
-    def __init__(self, sample_dir: Path = LEGACY_SAMPLE_DIR):
-        self.sample_dir = sample_dir
-        self._cached_bundle: Optional[Dict[str, Any]] = None
-
-    def load_bundle(self) -> Dict[str, Any]:
-        if self._cached_bundle is None:
-            bundle_path = self.sample_dir / "dataset.json"
-            if not bundle_path.exists():
-                try:
-                    from data.make_sample import generate_sample_dataset
-                    self._cached_bundle = generate_sample_dataset()
-                except ImportError:
-                    self._cached_bundle = {}
-            else:
-                with open(bundle_path, "r", encoding="utf-8") as f:
-                    self._cached_bundle = json.load(f)
-        return self._cached_bundle
-
-    def load_summary(self) -> Dict[str, Any]:
-        bundle = self.load_bundle()
-        return bundle.get("summary", {})
-
-    def load_events(self) -> List[Dict[str, Any]]:
-        bundle = self.load_bundle()
-        return bundle.get("events", [])
-
-    def load_faculty(self) -> List[Dict[str, Any]]:
-        bundle = self.load_bundle()
-        return bundle.get("faculty", [])
-
-    def load_rooms(self) -> List[Dict[str, Any]]:
-        bundle = self.load_bundle()
-        return bundle.get("rooms", [])
-
-    def load_groups(self) -> List[Dict[str, Any]]:
-        bundle = self.load_bundle()
-        return bundle.get("groups", [])
-
-    def load_students(self) -> List[Dict[str, Any]]:
-        bundle = self.load_bundle()
-        return bundle.get("students", [])
-
-    def load_baseline_timetable(self) -> List[Dict[str, Any]]:
-        bundle = self.load_bundle()
-        return bundle.get("baseline_timetable", [])
-
-
-# Global default loader instance for legacy timetable imports
-default_loader = DatasetLoader()

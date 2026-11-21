@@ -22,3 +22,4 @@ testpaths = ["backend/tests", "engine/tests"]
 python_files = ["test_*.py"]
 pythonpath = ["."]
 addopts = "-v"
+asyncio_default_fixture_loop_scope = "function"

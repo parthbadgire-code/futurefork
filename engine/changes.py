@@ -8,19 +8,16 @@ Provides:
 - apply_phased_delay: Branch 3 - Multi-milestone split (e.g. 50/50) avoiding debt/interest.
 - apply_discretionary_trim: Branch 4 - Optimized cuts across flexible categories to protect reserve.
 - apply_financial_change: Unified financial change dispatcher.
-- Retains backward-compatible timetable change appliers (shift_time_window, room_change, faculty_load_cap).
 """
 
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Optional
 
 from engine.model import (
     FinancialProblemInstance,
-    ProblemInstance,
     PurchaseGoal,
-    Room,
 )
 
 # ==============================================================================
@@ -134,6 +131,27 @@ def apply_discretionary_trim(
     return new_goal
 
 
+BRANCH_TYPES = ("upfront", "emi", "phased", "trim")
+
+_BRANCH_ALIASES = {
+    "upfront": ("upfront", "buy_now", "immediate"),
+    "emi": ("emi", "lease", "loan", "installment", "instalment"),
+    "phased": ("phase", "delay", "milestone", "two_stage"),
+    "trim": ("trim", "cut", "discretionary", "savings"),
+}
+
+
+def normalize_branch_type(change_type: str) -> str:
+    """Maps a change type or alias (e.g. "phased_delay", "discretionary_trim") to a canonical fork type."""
+    ct = str(change_type or "").lower()
+    for canonical, aliases in _BRANCH_ALIASES.items():
+        if any(a in ct for a in aliases):
+            return canonical
+    raise ValueError(
+        f"Unsupported change type '{change_type}'. Supported fork types: {', '.join(BRANCH_TYPES)}"
+    )
+
+
 def apply_financial_change(
     instance: FinancialProblemInstance,
     change: Dict[str, Any],
@@ -148,175 +166,10 @@ def apply_financial_change(
 
     base_goal = goal or PurchaseGoal.from_dict(params)
 
-    if any(k in change_type for k in ["upfront", "buy_now", "immediate"]):
-        return apply_upfront(instance, base_goal, params)
-    elif any(k in change_type for k in ["emi", "lease", "loan", "split_installment"]):
-        return apply_emi_split(instance, base_goal, params)
-    elif any(k in change_type for k in ["phase", "delay", "milestone", "two_stage"]):
-        return apply_phased_delay(instance, base_goal, params)
-    elif any(k in change_type for k in ["trim", "cut", "discretionary", "savings"]):
-        return apply_discretionary_trim(instance, base_goal, params)
-    else:
-        # Default to upfront
-        return apply_upfront(instance, base_goal, params)
-
-
-# ==============================================================================
-# TIMETABLE BACKWARD COMPATIBLE APPILERS
-# ==============================================================================
-
-class ChangeApplierRegistry:
-    def __init__(self):
-        self._handlers = {}
-
-    def register(self, change_type: str):
-        def decorator(fn):
-            self._handlers[change_type] = fn
-            return fn
-        return decorator
-
-    def apply(
-        self,
-        dataset: Any,
-        change: Dict[str, Any],
-    ) -> Any:
-        change_type = change.get("type", "shift_time_window")
-        params = change.get("params", {})
-
-        # If financial problem instance, route to financial applier
-        if isinstance(dataset, FinancialProblemInstance) or (
-            isinstance(dataset, dict) and "outflows" in dataset and "inflows" in dataset
-        ):
-            inst = (
-                dataset
-                if isinstance(dataset, FinancialProblemInstance)
-                else FinancialProblemInstance.from_dict(dataset)
-            )
-            return apply_financial_change(inst, change)
-
-        handler = self._handlers.get(change_type)
-        if not handler:
-            raise ValueError(f"Unsupported change type in catalog: {change_type}")
-
-        return handler(dataset, params)
-
-
-registry = ChangeApplierRegistry()
-
-
-@registry.register("shift_time_window")
-def apply_shift_time_window(
-    dataset: ProblemInstance,
-    params: Dict[str, Any],
-) -> Dict[str, Any]:
-    from_window = params.get("from", "afternoon")
-    to_window = params.get("to", "morning")
-    selection = params.get("selection", "all")
-    explicit_ids = set(params.get("ids", []))
-    n = params.get("n", 10)
-
-    target_slots = list(range(0, 4)) if to_window == "morning" else list(range(4, 8))
-    source_slots = list(range(4, 8)) if from_window == "afternoon" else list(range(0, 4))
-
-    baseline_assignments_by_event = {a.event_id: a for a in dataset.baseline_assignments}
-    events_in_source = []
-
-    for ev in dataset.events:
-        a = baseline_assignments_by_event.get(ev.event_id)
-        if a and a.slot in source_slots:
-            events_in_source.append(ev)
-
-    target_events: Set[str] = set()
-    if selection == "all":
-        target_events = {ev.event_id for ev in events_in_source}
-    elif selection == "electives":
-        target_events = {ev.event_id for ev in events_in_source if ev.is_elective}
-        if len(target_events) < 4:
-            target_events.update(ev.event_id for ev in dataset.events if ev.is_elective)
-    elif selection == "labs":
-        target_events = {ev.event_id for ev in events_in_source if ev.is_lab}
-    elif selection == "lowest_enrollment_n":
-        sorted_events = sorted(events_in_source, key=lambda e: e.expected_enrollment)
-        target_events = {ev.event_id for ev in sorted_events[:n]}
-    elif selection == "explicit_ids":
-        target_events = explicit_ids
-    else:
-        target_events = {ev.event_id for ev in events_in_source}
-
-    allowed_slots_per_event: Dict[str, List[int]] = {}
-    for ev in dataset.events:
-        if ev.event_id in target_events:
-            allowed_slots_per_event[ev.event_id] = target_slots
-        else:
-            allowed_slots_per_event[ev.event_id] = list(range(8))
-
-    return {
-        "dataset": dataset,
-        "change_type": "shift_time_window",
-        "target_events": target_events,
-        "allowed_slots_per_event": allowed_slots_per_event,
-        "rooms": dataset.rooms,
-        "faculty": dataset.faculty,
-        "events": dataset.events,
+    appliers = {
+        "upfront": apply_upfront,
+        "emi": apply_emi_split,
+        "phased": apply_phased_delay,
+        "trim": apply_discretionary_trim,
     }
-
-
-@registry.register("room_change")
-def apply_room_change(
-    dataset: ProblemInstance,
-    params: Dict[str, Any],
-) -> Dict[str, Any]:
-    action = params.get("action", "remove")
-    room_ids_to_act = set(params.get("room_ids", []))
-    modified_rooms = [r for r in dataset.rooms]
-
-    if action == "remove":
-        modified_rooms = [r for r in modified_rooms if r.room_id not in room_ids_to_act]
-    elif action == "add":
-        new_capacity = params.get("capacity", 50)
-        new_type = params.get("type", "lecture")
-        rids = list(room_ids_to_act) if room_ids_to_act else [params.get("room_id", "LAB204")]
-        for rid in rids:
-            if not any(r.room_id == rid for r in modified_rooms):
-                modified_rooms.append(
-                    Room(room_id=rid, name=f"Added Room {rid}", capacity=new_capacity, type=new_type)
-                )
-
-    allowed_slots_per_event = {ev.event_id: list(range(8)) for ev in dataset.events}
-    return {
-        "dataset": dataset,
-        "change_type": "room_change",
-        "rooms": modified_rooms,
-        "faculty": dataset.faculty,
-        "events": dataset.events,
-        "allowed_slots_per_event": allowed_slots_per_event,
-        "target_events": set(),
-    }
-
-
-@registry.register("faculty_load_cap")
-def apply_faculty_load_cap(
-    dataset: ProblemInstance,
-    params: Dict[str, Any],
-) -> Dict[str, Any]:
-    max_hours = params.get("max_hours_per_week", 15)
-    modified_faculty = [
-        copy.deepcopy(f) for f in dataset.faculty
-    ]
-    for f in modified_faculty:
-        f.max_hours = max_hours
-
-    allowed_slots_per_event = {ev.event_id: list(range(8)) for ev in dataset.events}
-    return {
-        "dataset": dataset,
-        "change_type": "faculty_load_cap",
-        "rooms": dataset.rooms,
-        "faculty": modified_faculty,
-        "events": dataset.events,
-        "allowed_slots_per_event": allowed_slots_per_event,
-        "target_events": set(),
-    }
-
-
-def apply_change(dataset: Any, change: Dict[str, Any]) -> Any:
-    return registry.apply(dataset, change)
+    return appliers[normalize_branch_type(change_type)](instance, base_goal, params)
